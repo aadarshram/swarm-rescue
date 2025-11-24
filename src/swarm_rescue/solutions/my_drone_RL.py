@@ -2,7 +2,8 @@
 RL-based drone controller for gym-style environment interface
 """
 
-from typing import Optional
+from typing import Optional, List, Tuple
+import numpy as np
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
@@ -40,7 +41,7 @@ class MyDroneRL(DroneAbstract):
         # RL Env runs one step behind. Save previous states for reward calculation.
         self.prev_state = None
         self.prev_action = None
-
+    
     def define_message_for_all(self) -> None:
         '''Define any custom messages to be sent to neighbors'''
         pass

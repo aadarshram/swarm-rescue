@@ -193,6 +193,7 @@ class RandomPolicy:
     """Simple random continuous policy for smoke testing."""
 
     def select_action(self, state: DroneState | None) -> DroneAction:
+
         return DroneAction(
             forward=np.random.uniform(-1, 1),
             lateral=np.random.uniform(-1, 1),
@@ -205,6 +206,7 @@ class DroneRLEnv:
 
     def __init__(self, drone: DroneAbstract):
         self.drone = drone
+
         self.reward_calculator = DroneReward()
         self.current_state = None
 
@@ -227,4 +229,5 @@ class DroneRLEnv:
         )
 
         done = (next_state.health <= 0)
-        return reward, done, {} # TODO extra info
+        info = {} # TODO extra info
+        return reward, done, info 

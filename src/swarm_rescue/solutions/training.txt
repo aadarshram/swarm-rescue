@@ -1,0 +1,11 @@
+Temporary notes for implementing training pipeline
+
+- figure out how to do env.reset
+- figure out if and how done signal works
+
+- only at inference u r bounded by surfacing only the control function of drone. not training. try to create a training script which can control the maps and simulation 
+
+
+
+---
+# Initalize environment

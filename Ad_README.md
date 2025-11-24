@@ -1,5 +1,18 @@
 NOTE: Contains additional info (team specific) apart from general @ README.md
 
+## TODO
+- Clean implementation of training script
+- Clean implementation of policies
+- Reward class
+- State encoder class ?? Arnav
+- Implement termination (bc we are one step behind)
+- reward. can it depend on time? how to handle weight combination for different types. Unknown maps?
+- extract map size from sim, extract time left from sim. how??
+- map based on semantic sensor.
+- try sharp exponential negative reward for walls based on lidar distance to wall.
+- implement policy traning script.
+- map is 0,1,2,3
+
 ## Setup
 
 1. Clone the team's fork:
