@@ -12,6 +12,8 @@ from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.misc_data import MiscData
 from swarm_rescue.simulation.utils.constants import DRONE_INITIAL_HEALTH
+from swarm_rescue.solutions.mapping import OccupancyGrid
+from swarm_rescue.simulation.utils.pose import Pose
 
 
 # ================================================================
@@ -99,17 +101,35 @@ class DroneState:
     map_matrix: Optional[np.ndarray] = None
 
     @classmethod
-    def from_drone(cls, drone: DroneAbstract, map_matrix: Optional[np.ndarray] = None) -> "DroneState":
+    def from_drone(cls, drone: DroneAbstract, pose: Pose, grid: OccupancyGrid) -> "DroneState":
         """
         Construct a DroneState directly from the simulator's DroneAbstract object.
         Pulls all sensor and internal data to create a full observation snapshot.
         """
-        gps_sensor = getattr(drone, "gps_sensor", None)
-        compass_sensor = getattr(drone, "compass_sensor", None)
-        odometer = getattr(drone, "odometer_sensor", None)
-        lidar = getattr(drone, "lidar_sensor", None)
-        semantic = getattr(drone, "semantic_sensor", None)
+        gps_sensor = drone.gps_values()
+        compass_sensor = drone.compass_values()
+        odometer = drone.odometer_values()
+        #lidar = drone.lidar_values()
+        #semantic = drone.semantic_values()
 
+        # Finding Pose, assuming GPS gives absolute position. In no gps zones, we use odom.
+        if gps_sensor is not None and compass_sensor is not None: 
+            pose = Pose(np.asarray(gps_sensor.position),compass_sensor.angle)
+        elif odometer is not None:
+            dist_travel = getattr(odometer, "delta_distance", 0.0)
+            alpha = getattr(odometer, "delta_alpha", 0.0)
+            theta = getattr(odometer, "delta_theta", 0.0)
+
+            beta = pose.orientation + alpha
+            x = pose.position[0] + dist_travel*np.cos(beta)
+            y = pose.position[1] + dist_travel*np.sin(beta)
+            angle = pose.orientation + theta
+            pose = Pose(np.asarray((x,y)),angle)
+
+        # Updating the grid
+        grid.update_grid(pose=pose)
+
+        '''
         # Default fallbacks
         gps_x, gps_y = (0.0, 0.0)
         gps_theta = 0.0
@@ -148,27 +168,21 @@ class DroneState:
                 }
                 for ray in raw_data
             ]
+        '''
 
         # Drone health and grasping state
-        health = getattr(drone, "health_points", DRONE_INITIAL_HEALTH)
-        grasped = getattr(drone, "grasped", False)
+        health = drone.drone_health()
+        grasped = drone.grasped_wounded_persons()
 
         # Communication placeholder
         comm_msg = None
 
         return cls(
-            gps_x=gps_x,
-            gps_y=gps_y,
-            gps_theta=gps_theta,
-            dist_travel=dist_travel,
-            alpha=alpha,
-            theta=theta,
-            semantic_data=semantic_data,
+            pose = pose,
             comm_msg=comm_msg,
             health=health,
             grasped=grasped,
-            lidar_scan=lidar_scan,
-            map_matrix=map_matrix,
+            map_matrix=grid,
         )
 
 # ================================================================
@@ -207,10 +221,14 @@ class DroneRLEnv:
         self.drone = drone
         self.reward_calculator = DroneReward()
         self.current_state = None
+        
+        self.size_area_world = (100,100) # NEED TO GET FROM MISC DATA
+        self.grid = OccupancyGrid(self.size_area_world, resolution=5, lidar=drone.lidar(), semantic=drone.semantic())
+        self.pose = Pose()
 
     def get_state(self) -> DroneState:
         """Extract the full drone state from simulator sensors."""
-        return DroneState.from_drone(self.drone)
+        return DroneState.from_drone(self.drone, self.pose, self.grid)
 
     def step(self, current_state, action: DroneAction, next_state) -> Tuple[float, bool, Dict]:
         """
