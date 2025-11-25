@@ -33,32 +33,53 @@ def process_semantic(semantic_values):
             float(item.angle),
             1.0 if item.grasped else 0.0
         ])
-    return np.array(rows, dtype=np.float32)
-
-
+    
+    # Pad to RESOLUTION_SEMANTIC_SENSOR rows (some rays may not detect anything)
+    result = np.zeros((constants.RESOLUTION_SEMANTIC_SENSOR, 3), dtype=np.float32)
+    actual_rows = min(len(rows), constants.RESOLUTION_SEMANTIC_SENSOR)
+    if actual_rows > 0:
+        result[:actual_rows] = rows[:actual_rows]
+    
+    return result
 
 def build_obs(drone):
     """Convert raw drone sensors → RLEnv format"""
-    lidar = np.array(drone.lidar_values(), dtype=np.float32)
-    lidar = np.clip(lidar / constants.MAX_RANGE_LIDAR_SENSOR, 0, 1)
+    # Get lidar values (handle None case)
+    lidar_raw = drone.lidar_values()
+    if lidar_raw is None:
+        lidar = np.zeros(180, dtype=np.float32)
+    else:
+        lidar = np.array(lidar_raw, dtype=np.float32)
+        lidar = lidar[:-1]  # Exclude last ray (repeated at 360 degrees)
+        lidar = np.clip(lidar / constants.MAX_RANGE_LIDAR_SENSOR, 0, 1)
 
-    pose = np.array([ # Need to normalize
-        drone.measured_gps_position()[0],
-        drone.measured_gps_position()[1],
-        drone.measured_compass_angle()
-    ], dtype=np.float32) 
+    # Get pose (handle None case)
+    gps = drone.measured_gps_position()
+    angle = drone.measured_compass_angle()
+    if gps is None or angle is None:
+        pose = np.zeros(3, dtype=np.float32)
+    else:
+        pose = np.array([gps[0], gps[1], angle], dtype=np.float32)
+        # If map size exists in drone, normalize
+        if drone.size_area is not None:
+            pose[0] /= drone.size_area[0]
+            pose[1] /= drone.size_area[1]
 
-    # If map size exists in drone, normalize
-    if drone.size_area is not None:
-        pose[0] /= drone.size_area[0]
-        pose[1] /= drone.size_area[1] 
+    # Get velocity (handle None case)
+    velocity_raw = drone.measured_velocity()
+    if velocity_raw is None:
+        vel = np.zeros(2, dtype=np.float32)
+    else:
+        vel = np.array([velocity_raw[0], velocity_raw[1]], dtype=np.float32)
+        # Clip velocity to reasonable range (drones shouldn't exceed ±10 m/s)
+        vel = np.clip(vel / 10.0, -1.0, 1.0)
 
-    vel = np.array([
-        drone.measured_velocity()[0],
-        drone.measured_velocity()[1]
-    ], dtype=np.float32)
-
-    semantic = process_semantic(drone.semantic_values())
+    # Get semantic values (handle None case)
+    semantic_raw = drone.semantic_values()
+    if semantic_raw is None or len(semantic_raw) == 0:
+        semantic = np.zeros((constants.RESOLUTION_SEMANTIC_SENSOR, 3), dtype=np.float32)
+    else:
+        semantic = process_semantic(semantic_raw)
 
     grasper = np.array([1.0 if len(drone.grasped_wounded_persons()) > 0 else 0.0], dtype=np.float32)      
 
@@ -69,6 +90,7 @@ def build_obs(drone):
         "semantic": semantic,
         "grasper": grasper
     }
+
 
 def flatten_observation(obs):
     vec = np.concatenate([

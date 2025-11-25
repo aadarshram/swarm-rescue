@@ -184,6 +184,11 @@ class DroneRLEnv(gym.Env):
         self.total_rescued = 0
         self.ep_count += 1
 
+        # Step the playground once to initialize sensors (they return NaN initially)
+        if self._playground is not None and self._agent is not None:
+            no_action_cmd = {self._agent: self.construct_action(np.zeros(4, dtype=np.float32))}
+            self._playground.step(all_commands=no_action_cmd, all_messages={})
+
         obs = self._get_obs()
         info = self._get_info()
         return obs, info
@@ -250,7 +255,7 @@ class DroneRLEnv(gym.Env):
                 if self._agent.reward != 0:
                     self.total_rescued += int(self._agent.reward)
             
-            # Check if all wounded persons rescued
+            # Check if all wounded persons rescued (termination condition)
             total_wounded = getattr(self._map, "_number_wounded_persons", 0)
             if self.total_rescued >= total_wounded and total_wounded > 0:
                 reward += 50.0
@@ -283,17 +288,6 @@ class DroneRLEnv(gym.Env):
             reward -= delta_distances / 5.0
 
         self.current_step += 1
-
-        # Exploration score if requested
-        if self.use_exp_map and hasattr(self._map, "explored_map"):
-            # Update exploration map with drone positions
-            if self._agent is not None:
-                self._map.explored_map.update_drones([self._agent])
-            
-            current_score = self._map.explored_map.score()
-            if self.last_exp_score is not None:
-                reward += 50.0 * (current_score - self.last_exp_score)
-            self.last_exp_score = current_score
 
         # Check for episode truncation
         if self.current_step >= self.max_steps:

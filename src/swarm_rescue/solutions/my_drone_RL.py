@@ -5,14 +5,13 @@ RL-based drone controller for gym-style environment interface
 # Imports
 import numpy as np
 from typing import Optional
-import gymnasium as gym
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.misc_data import MiscData
-from swarm_rescue.simulation.utils import constants
 from swarm_rescue.solutions.my_drone_policies import RandomPolicy
 from swarm_rescue.solutions.rl_utils import ACTION_SPACE, build_obs, obs_to_tensor, to_commands_dict
+
 class MyDroneRL(DroneAbstract):
     """
     RL-based drone controller.
@@ -28,11 +27,9 @@ class MyDroneRL(DroneAbstract):
 
         self.size_area = misc_data.size_area if misc_data else None
         self.iteration:int = 0
-        self.droneReady = False
 
         self.msg_data = None
 
-        self.lidar_ray_angles = self.lidar().ray_angles
         self.rescue_center_pos = None
         self.init_position = None
 
@@ -47,23 +44,48 @@ class MyDroneRL(DroneAbstract):
         self.action_space = ACTION_SPACE
 
         # Initialize RL Policy
-        self.model = None
+        self.model = None # Placeholder for loading a trained model
         self.policy = RandomPolicy(self.action_space)
+        self.use_time_feature = False  # Will be set based on model observation space
+        self.max_steps = misc_data.max_timestep_limit if misc_data else 500 # Default max steps for time normalization
+        
+        # Load trained model if path provided
+        self.model_path = kwargs.get('model_path', None)
+        if self.model_path:
+            self.load_model(self.model_path)
 
         # Save heuristics
         self.prev_state = None
         self.prev_action = None
+        
         # Episode stats
         self.total_reward = 0.0
         self.steps = 0
+    
+    def load_model(self, model_path):
+        """Load a trained SB3 model and configure observation space"""
+        try:
+            from stable_baselines3 import PPO
+            self.model = PPO.load(model_path)
+            
+            # Verify observation space
+            # Expected: 180 (lidar) + 105 (semantic) + 3 (pose) + 2 (vel) + 1 (grasper) = 291
+            obs_dim = self.model.observation_space.shape[0]
+            if obs_dim == 291:
+                self.log_info(f"Loaded model with correct observation space (obs_dim={obs_dim})")
+            else:
+                self.log_warning(f"Model observation dimension {obs_dim} != expected 291")
+            
+            self.log_info(f"Loaded trained model from {model_path}")
+        except Exception as e:
+            self.log_error(f"Failed to load model from {model_path}: {e}")
+            self.model = None
 
     def get_observation(self):
         return build_obs(self)
 
     def define_message_for_all(self):
         '''Define any custom messages to be sent to neighbors'''
-        if not self.droneReady:
-            return None
         self.msg_data = (self.identifier, (self.measured_gps_position(), self.measured_compass_angle()))
         return self.msg_data
     
@@ -111,12 +133,20 @@ class MyDroneRL(DroneAbstract):
         obs = self.get_observation()
 
         if self.model is not None:
-            x = obs_to_tensor(obs)
-            action = self.model(x).detach().cpu().numpy()[0]
+            # For SB3 models, flatten the observation (291 dimensions)
+            from swarm_rescue.solutions.rl_utils import flatten_observation
+            flat_obs = flatten_observation(obs)
+            
+            # No time feature - just use base observation (291 dims)
+            # Simpler and works better for variable-length episodes
+            
+            # Predict action using SB3 model
+            action, _states = self.model.predict(flat_obs, deterministic=True)
         else: # Default to random policy
             action = self.policy.select_action(obs)
 
         action = np.clip(action, self.action_space.low, self.action_space.high)
+        self.steps += 1
 
         return to_commands_dict(action)
     

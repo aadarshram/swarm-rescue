@@ -13,6 +13,9 @@ NOTE: Contains additional info (team specific) apart from general @ README.md
 - implement policy traning script.
 - map is 0,1,2,3
 
+
+- 26.11.25:
+- Gym comaptible implemention for lidar processed state.
 ## Setup
 
 1. Clone the team's fork:
