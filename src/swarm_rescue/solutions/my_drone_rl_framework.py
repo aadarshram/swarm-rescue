@@ -231,7 +231,20 @@ class DroneRLEnv(gym.Env):
             # Step the playground (core simulation step)
             if self._playground is not None:
                 self._playground.step(all_commands=cmd, all_messages={})
-            
+            # GUI update for rendering
+            if self.render_mode == "human":
+                try:
+                    if self.gui is not None:
+                        self.gui.draw()
+                        self.gui._playground.window.flip()
+                        self.gui._playground.window.dispatch_events()
+                        if self.gui._playground.window.has_exit:
+                            terminated = True
+                            truncated = True
+                            break
+                except Exception:
+                    pass
+
             # Track rescues (drones get reward attribute when they rescue someone)
             if self._agent is not None and hasattr(self._agent, "reward"):
                 if self._agent.reward != 0:

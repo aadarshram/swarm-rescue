@@ -11,6 +11,7 @@ Usage:
 import argparse
 import numpy as np
 import time
+import arcade
 
 from swarm_rescue.solutions.my_drone_rl_framework import DroneRLEnv
 from swarm_rescue.solutions.my_drone_RL import MyDroneRL
@@ -56,7 +57,7 @@ def train_random_policy(
     # Create environment
     env = DroneRLEnv(
         map_name=map_name,
-        render_mode="rgb_array" if not headless else None,
+        render_mode="human" if not headless else None,
         max_steps=max_steps,
         fixed_step=fixed_step,
         use_exp_map=use_exp_map,
@@ -89,6 +90,9 @@ def train_random_policy(
             
             # Step environment
             obs, reward, terminated, truncated, info = env.step(action)
+
+            # Update GUI if rendering
+            # Handled by DroneRLEnv.step() internally for smoother animation
             
             episode_reward += reward
             episode_length += 1
@@ -158,9 +162,10 @@ def eval_policy(
     print("-" * 60)
     
     # Create environment
+    render_mode = "rgb_array" if render_video else ("human" if not headless else None)
     env = DroneRLEnv(
         map_name=map_name,
-        render_mode="rgb_array" if render_video else None,
+        render_mode=render_mode,
         max_steps=max_steps,
         fixed_step=fixed_step,
         use_exp_map=use_exp_map,
@@ -179,7 +184,6 @@ def eval_policy(
         
         # Reset environment
         obs, info = env.reset()
-        
         episode_reward = 0.0
         episode_length = 0
         done = False
@@ -191,7 +195,10 @@ def eval_policy(
             
             # Step environment
             obs, reward, terminated, truncated, info = env.step(action)
-            
+
+            # Update GUI if rendering
+            # Handled by DroneRLEnv.step() internally for smoother animation
+
             episode_reward += reward
             episode_length += 1
             done = terminated or truncated
