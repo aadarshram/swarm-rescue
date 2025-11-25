@@ -11,8 +11,7 @@ from typing import Optional, Dict, Tuple
 import gymnasium as gym
 from gymnasium import spaces
 import arcade
-
-from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
+# from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
 from swarm_rescue.simulation.utils.constants import MAX_RANGE_LIDAR_SENSOR
 from swarm_rescue.solutions.my_drone_RL import MyDroneRL
 from swarm_rescue.maps.map_medium_01 import MapMedium01
@@ -146,6 +145,13 @@ class DroneRLEnv(gym.Env):
             except Exception:
                 pass
         
+        # Explicitly close arcade window to avoid zombies
+        try:
+            import arcade
+            arcade.close_window()
+        except Exception:
+            pass
+        
         if hasattr(self, '_playground') and self._playground is not None:
             try:
                 self._playground.cleanup()
@@ -165,7 +171,15 @@ class DroneRLEnv(gym.Env):
         self._agent = self._playground.agents[0] if self._playground.agents else None
         
         # Create GUI for rendering (can be headless)
-        self.gui = GuiSR(the_map=self._map, headless=self.headless)
+        if self.render_mode is not None:
+            try:
+                from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
+                self.gui = GuiSR(the_map=self._map, headless=self.headless)
+            except Exception as e:
+                print(f"Warning: Could not create GuiSR: {e}")
+                self.gui = None
+        else:
+            self.gui = None
         
         # Reset exploration tracking
         if hasattr(self._map, 'explored_map'):
@@ -240,15 +254,26 @@ class DroneRLEnv(gym.Env):
             if self.render_mode == "human":
                 try:
                     if self.gui is not None:
+                        # Check if window was closed externally
+                        if hasattr(self.gui._playground.window, 'has_exit') and self.gui._playground.window.has_exit:
+                            terminated = True
+                            truncated = True
+                            break
+                            
                         self.gui.draw()
                         self.gui._playground.window.flip()
                         self.gui._playground.window.dispatch_events()
-                        if self.gui._playground.window.has_exit:
+                        
+                        # Check again after dispatching events
+                        if hasattr(self.gui._playground.window, 'has_exit') and self.gui._playground.window.has_exit:
                             terminated = True
                             truncated = True
                             break
                 except Exception:
-                    pass
+                    # If window is closed, accessing it might raise exception
+                    terminated = True
+                    truncated = True
+                    break
 
             # Track rescues (drones get reward attribute when they rescue someone)
             if self._agent is not None and hasattr(self._agent, "reward"):

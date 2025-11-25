@@ -39,6 +39,7 @@ from stable_baselines3.common.logger import configure
 
 # Local imports
 from swarm_rescue.solutions.sb3_wrappers import make_sb3_env
+from swarm_rescue.solutions.my_drone_rl_framework import DroneRLEnv
 
 
 # Algorithm registry - import algorithms as needed
@@ -425,7 +426,6 @@ def evaluate_model(
     model = BaseAlgorithm.load(model_path)
     
     # Create environment
-    print("Creating environment...")
     env = make_sb3_env(
         map_name=map_name,
         max_steps=max_steps,
@@ -434,7 +434,6 @@ def evaluate_model(
         use_time_feature=use_time_feature,
         normalize_reward=False,
     )
-    env = Monitor(env)
     
     # Evaluate
     episode_rewards = []
