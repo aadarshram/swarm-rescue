@@ -2,232 +2,317 @@
 RL framework components for drone control.
 Implements OpenAI Gym style environment, reward system, and policy interfaces.
 """
-import math
-import random
+
+import gc
+import os
 import numpy as np
-from typing import Optional, Dict, Any, Tuple, List
-from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
 
-from swarm_rescue.simulation.drone.controller import CommandsDict
-from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
-from swarm_rescue.simulation.utils.misc_data import MiscData
-from swarm_rescue.simulation.utils.constants import DRONE_INITIAL_HEALTH
+import gymnasium as gym
+from gymnasium import spaces
+import arcade
 
+from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
+from swarm_rescue.simulation.utils.constants import MAX_RANGE_LIDAR_SENSOR
+from swarm_rescue.solutions.my_drone_RL import MyDroneRL
+from swarm_rescue.maps.map_medium_01 import MapMedium01
+from swarm_rescue.maps.map_intermediate_01 import MapIntermediate01
+from swarm_rescue.solutions.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, to_commands_dict
 
-# ================================================================
-# ACTION CLASS
-# ================================================================
-@dataclass
-class DroneAction:
+map_dict = {
+    "Medium01": MapMedium01,
+    "Intermediate01": MapIntermediate01,
+}
+
+class DroneRLEnv(gym.Env):
     """
-    Continuous drone action space.
+    Variables:
+    - max_steps: total timesteps to run before terminate the episdoe
+    - fixed_steps: number of steps to step the playground per command produce by the agent
+    - map_name: select the maps to run in.
 
-    forward, lateral, and rotation are all normalized to [-1, 1].
-    The simulator will internally map these to physical forces/velocities.
-    """
-    forward: float
-    lateral: float
-    rotation: float
-    grasper: int
+    Oservation Space:
+    - Pose: true_position and angle.
+    - Velocity: velocity x and y axis.
+    - Semantic: Rescue center, human, and drones. Data: distance, ray_angle, grased.
+    - Lidar: 180 distance rays.
 
-    def clip(self) -> "DroneAction":
-        """Clip each control signal to its valid range."""
-        self.forward = float(np.clip(self.forward, -1.0, 1.0))
-        self.lateral = float(np.clip(self.lateral, -1.0, 1.0))
-        self.rotation = float(np.clip(self.rotation, -1.0, 1.0))
-        return self
+    Action Space: continuous or multi-discrete
+    - Forward, Lateral, Rotation: [-1, 1]
+    - Grasper: {0, 1}
 
-    def to_command_dict(self) -> CommandsDict:
-        """
-        Convert this action into the simulator's CommandsDict object,
-        which is directly interpreted by the drone's low-level controller.
-        """
-        self.clip()
-        commands : CommandsDict = {
-            "forward": self.forward,
-            "lateral": self.lateral,
-            "rotation": self.rotation,
-            "grasper": self.grasper
-        }
-        return commands        
+    Reward function
+    - Every step: -0.5
+    - If hit the wall: -1
+    - Touch the person: +1
+    - Grasp each person back to rescue center: +50
+    - Rotation penalty: abs(rotation_value) - to avoid the agent constantly rotating to prevent the wall
+    - Exploration increase score
 
-# ================================================================
-# STATE CLASS
-# ================================================================
-@dataclass
-class DroneState:
-    """
-    Represents the full observable state of a drone in the swarm-rescue simulation.
+    Terminate when bring all the humans back to the rescue center.
 
-    Attributes:
-        gps_x, gps_y (float): Global GPS position in pixels.
-        gps_theta (float): Orientation from compass sensor in radians [-π, π].
-
-        dist_travel (float): Distance moved since last timestep (pixels).
-        alpha (float): Relative movement direction since last timestep (radians).
-        theta (float): Orientation change since last timestep (radians).
-
-        semantic_data (List[Dict[str, Any]]): 35 semantic rays, each entry containing:
-            {
-              "distance": float,   # distance in pixels, [0, 200]
-              "angle": float,      # ray angle in radians [-π, π]
-              "entity_type": str,  # e.g., "WoundedPerson", "RescueCenter", "Drone"
-              "grasped": bool      # whether that object is being grasped
-            }
-        comm_msg (Optional[Any]): Placeholder for communication data (unused for now).
-        health (int): Drone health points (integer, decreases on collision).
-        grasped (bool): True if currently carrying or holding an object.
-        lidar_scan (np.ndarray): 181 Lidar distance readings (pixels), 360° FOV.
-        map_matrix (Optional[np.ndarray]): Full exploration map (provided by environment).
     """
 
-    gps_x: float
-    gps_y: float
-    gps_theta: float
+    metadata = {"render.modes": ["human", "rgb_array"], "render_fps": 30}
 
-    dist_travel: float
-    alpha: float
-    theta: float
+    def __init__(
+        self,
+        map_name: str = "Medium01",
+        render_mode: str = "rgb_array",
+        max_steps: int = 100,
+        fixed_step: int = 20,
+        use_exp_map: bool = False,
+        headless: bool = False,
+        drone_cls=MyDroneRL,
+    ):
+        super().__init__()
 
-    semantic_data: List[Dict[str, Any]]
-    comm_msg: Optional[Any]
+        if map_name in map_dict:
+            self.map_name = map_name
+            self.map_cls = map_dict[map_name]
+        else:
+            raise ValueError(f"Unknown map_name {map_name}")
 
-    health: int
-    grasped: bool
+        # Config
+        self.render_mode = render_mode
+        self.max_steps = max_steps
+        self.fixed_step = fixed_step
+        self.use_exp_map = use_exp_map
+        self.drone_cls = drone_cls
+        self.headless = bool(headless)
 
-    lidar_scan: np.ndarray
-    map_matrix: Optional[np.ndarray] = None
+        self._map = None
+        self._playground = None
+        self._agent = None
+        self.map_size = None
 
-    @classmethod
-    def from_drone(cls, drone: DroneAbstract, map_matrix: Optional[np.ndarray] = None) -> "DroneState":
-        """
-        Construct a DroneState directly from the simulator's DroneAbstract object.
-        Pulls all sensor and internal data to create a full observation snapshot.
-        """
-        gps_sensor = getattr(drone, "gps_sensor", None)
-        compass_sensor = getattr(drone, "compass_sensor", None)
-        odometer = getattr(drone, "odometer_sensor", None)
-        lidar = getattr(drone, "lidar_sensor", None)
-        semantic = getattr(drone, "semantic_sensor", None)
+        self.fixed_step = fixed_step
+        self.total_rescued = 0
+        self.map_size = None
 
-        # Default fallbacks
-        gps_x, gps_y = (0.0, 0.0)
-        gps_theta = 0.0
-        dist_travel = alpha = theta = 0.0
-        lidar_scan = np.zeros(181, dtype=np.float32)
-        semantic_data: List[Dict[str, Any]] = []
-
-        # GPS position (x, y)
-        if gps_sensor is not None:
-            gps_x, gps_y = gps_sensor.position
-
-        # Orientation angle
-        if compass_sensor is not None:
-            gps_theta = compass_sensor.angle
-
-        # Odometer delta values
-        if odometer is not None:
-            dist_travel = getattr(odometer, "delta_distance", 0.0)
-            alpha = getattr(odometer, "delta_alpha", 0.0)
-            theta = getattr(odometer, "delta_theta", 0.0)
-
-        # Lidar readings (181 rays)
-        if lidar is not None and hasattr(lidar, "data"):
-            lidar_scan = np.array(lidar.data, dtype=np.float32)
-
-        # Semantic sensor output (35 rays)
-        if semantic is not None and hasattr(semantic, "data"):
-            raw_data = semantic.data
-            # Normalize to a consistent list of dicts
-            semantic_data = [
-                {
-                    "distance": getattr(ray, "distance", 0.0),
-                    "angle": getattr(ray, "angle", 0.0),
-                    "entity_type": getattr(ray, "entity_type", None),
-                    "grasped": getattr(ray, "grasped", False),
-                }
-                for ray in raw_data
-            ]
-
-        # Drone health and grasping state
-        health = getattr(drone, "health_points", DRONE_INITIAL_HEALTH)
-        grasped = getattr(drone, "grasped", False)
-
-        # Communication placeholder
-        comm_msg = None
-
-        return cls(
-            gps_x=gps_x,
-            gps_y=gps_y,
-            gps_theta=gps_theta,
-            dist_travel=dist_travel,
-            alpha=alpha,
-            theta=theta,
-            semantic_data=semantic_data,
-            comm_msg=comm_msg,
-            health=health,
-            grasped=grasped,
-            lidar_scan=lidar_scan,
-            map_matrix=map_matrix,
-        )
-
-# ================================================================
-# REWARD, POLICY, AND ENVIRONMENT
-# ================================================================
-class DroneReward:
-    """Calculates rewards based on the drone's actions and state transitions"""
-
-    def __init__(self):
-        pass
-
-    def calculate(self, current_state: DroneState, action: DroneAction, next_state: DroneState) -> float:
-        """Calculate reward based on state transition"""
-        if current_state is None:
-            return 0.0  # No reward for initial state 
+        self.action_space = ACTION_SPACE
         
-        reward = -1.0 # penalize time step
-        return reward
+        self.observation_space = OBSERVATION_SPACE
+        
+        # Bookkeeping
+        self.ep_count = 0
+        self.current_step = 0
+        self.total_rescued = 0
+        self.frames = []
+        self.last_exp_score = None
 
+        self.re_init()
 
-class RandomPolicy:
-    """Simple random continuous policy for smoke testing."""
+    def construct_action(self, action):
+        """Convert action array to CommandsDict format expected by the simulator"""
+        # Clip values to valid range [-1, 1] for continuous, [0, 1] for grasper
+        action = np.clip(action, [-1, -1, -1, 0], [1, 1, 1, 1])
+        # Convert to commands using rl_utils helper
+        return to_commands_dict(action)
+        
+    def get_distance(self, pos_a, pos_b):
+        return np.sqrt((pos_a[0] - pos_b[0]) ** 2 + (pos_a[1] - pos_b[1]) ** 2)
+      
 
-    def select_action(self, state: DroneState | None) -> DroneAction:
+    def _get_obs(self):
+        obs = build_obs(self._agent)
+        return obs
 
-        return DroneAction(
-            forward=np.random.uniform(-1, 1),
-            lateral=np.random.uniform(-1, 1),
-            rotation=np.random.uniform(-1, 1),
-            grasper=random.choice([0, 1])
-        )
+    def _get_info(self):
+        info = {}
+        info["map_name"] = self.map_name
+        
+        # Get wounded persons positions if available
+        if hasattr(self._map, '_wounded_persons_pos'):
+            info["wounded_people_pos"] = self._map._wounded_persons_pos
+        
+        # Get rescue center position if available
+        if hasattr(self._map, '_rescue_center_pos'):
+            info["rescue_zone"] = self._map._rescue_center_pos
+        
+        # Get drone position
+        if self._agent is not None:
+            info["drones_true_pos"] = self._agent.measured_gps_position()
+        
+        return info
 
-class DroneRLEnv:
-    """Lightweight RL environment wrapper for a single drone."""
+    def re_init(self):
+        """(Re)create map, playground and main agent. Uses drone_cls with training mode off."""
+        
+        # Clean up previous resources
+        if hasattr(self, 'gui') and self.gui is not None:
+            try:
+                self.gui.close()
+            except Exception:
+                pass
+        
+        if hasattr(self, '_playground') and self._playground is not None:
+            try:
+                self._playground.cleanup()
+            except Exception:
+                pass
+        
+        gc.collect()
+        
+        # Create new map with the drone class
+        self._map = self.map_cls(drone_type=self.drone_cls)
+        
+        # Get map properties
+        self.map_size = self._map.size_area
+        self._playground = self._map.playground
+        
+        # Get the first drone as the agent (single agent for now)
+        self._agent = self._playground.agents[0] if self._playground.agents else None
+        
+        # Create GUI for rendering (can be headless)
+        self.gui = GuiSR(the_map=self._map, headless=self.headless)
+        
+        # Reset exploration tracking
+        if hasattr(self._map, 'explored_map'):
+            self._map.explored_map.reset()
+            self.last_exp_score = self._map.explored_map.score()
 
-    def __init__(self, drone: DroneAbstract):
-        self.drone = drone
+    # Gym API
 
-        self.reward_calculator = DroneReward()
-        self.current_state = None
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
 
-    def get_state(self) -> DroneState:
-        """Extract the full drone state from simulator sensors."""
-        return DroneState.from_drone(self.drone)
+        super().reset(seed=seed)
 
-    def step(self, current_state, action: DroneAction, next_state) -> Tuple[float, bool, Dict]:
+        self.re_init()
+
+        self.current_step = 0
+        self.total_rescued = 0
+        self.ep_count += 1
+
+        obs = self._get_obs()
+        info = self._get_info()
+        return obs, info
+
+    def render(self):
+        if self.render_mode == "rgb_array":
+            try:
+                return self.gui.get_playground_image()
+            except Exception:
+                return None
+        elif self.render_mode == "human":
+            return None
+
+    def get_all_frames(self):
+        return self.frames
+
+    def step(self, action):
         """
-        Post-hoc step function to process action execution results. Returns:
-        - reward
-        - done flag (True if drone destroyed)
-        - extra info dict (reserved)
+        Execute one environment step with the given action.
+        Follows the pattern from GuiSR.on_update() and Launcher.one_round()
         """
+        frame_skip = 5
+        counter = 0
+        done = False
 
-        reward = self.reward_calculator.calculate(
-            current_state,
-            action,
-            next_state
-        )
+        terminated, truncated = False, False
 
-        done = (next_state.health <= 0)
-        info = {} # TODO extra info
-        return reward, done, info 
+        # ROTATION PENALTY
+        reward = -0.5 - np.abs(action[2])  # discourage excessive rotation
+
+        # Save initial distances to rescue center for reward calculation
+        prev_distances = []
+        wounded_persons = getattr(self._map, "_wounded_persons", [])
+        rescue_center_pos = getattr(self._map, "_rescue_center_pos", None)
+        
+        if rescue_center_pos and len(rescue_center_pos) > 0:
+            for person in wounded_persons:
+                prev_distances.append(self.get_distance(person.position, rescue_center_pos[0]))
+
+        # Run several simulator ticks per action (like GuiSR.on_update loop)
+        while counter < self.fixed_step and not done:
+            # Construct command dict for the agent
+            cmd = {self._agent: self.construct_action(action)}
+            
+            # Step the playground (core simulation step)
+            if self._playground is not None:
+                self._playground.step(all_commands=cmd, all_messages={})
+            
+            # Track rescues (drones get reward attribute when they rescue someone)
+            if self._agent is not None and hasattr(self._agent, "reward"):
+                if self._agent.reward != 0:
+                    self.total_rescued += int(self._agent.reward)
+            
+            # Check if all wounded persons rescued
+            total_wounded = getattr(self._map, "_number_wounded_persons", 0)
+            if self.total_rescued >= total_wounded and total_wounded > 0:
+                reward += 50.0
+                terminated = True
+                break
+
+            # Capture frames for video if needed
+            if counter % frame_skip == 0 and self.render_mode == "rgb_array":
+                try:
+                    self.frames.append(self.gui.get_playground_image())
+                except Exception:
+                    pass
+            
+            counter += 1
+
+        # Add collision and touch rewards (if agent has these methods)
+        if self._agent is not None:
+            if hasattr(self._agent, "is_collided"):
+                reward -= float(self._agent.is_collided())
+            if hasattr(self._agent, "touch_human"):
+                reward += float(self._agent.touch_human())
+
+        # Distance-based reward: encourage moving wounded closer to rescue
+        if rescue_center_pos and len(rescue_center_pos) > 0:
+            delta_distances = 0.0
+            for idx, person in enumerate(wounded_persons):
+                new_d = self.get_distance(person.position, rescue_center_pos[0])
+                old_d = prev_distances[idx] if idx < len(prev_distances) else new_d
+                delta_distances += (new_d - old_d)
+            reward -= delta_distances / 5.0
+
+        self.current_step += 1
+
+        # Exploration score if requested
+        if self.use_exp_map and hasattr(self._map, "explored_map"):
+            # Update exploration map with drone positions
+            if self._agent is not None:
+                self._map.explored_map.update_drones([self._agent])
+            
+            current_score = self._map.explored_map.score()
+            if self.last_exp_score is not None:
+                reward += 50.0 * (current_score - self.last_exp_score)
+            self.last_exp_score = current_score
+
+        # Check for episode truncation
+        if self.current_step >= self.max_steps:
+            truncated = True
+            reward -= 20.0
+
+        # Get observation and info
+        obs = self._get_obs()
+        info = self._get_info()
+        info["reward"] = reward
+        info["done"] = truncated or terminated
+        info["total_rescued"] = self.total_rescued
+        info["current_step"] = self.current_step
+        
+        if info["done"]:
+            info["ep_frames"] = list(self.frames)
+
+        return obs, float(reward), bool(terminated), bool(truncated), info
+
+    def close(self):
+        try:
+            if self.gui:
+                self.gui.close()
+        except Exception:
+            pass
+        try:
+            if self._playground:
+                self._playground.cleanup()
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            arcade.close_window()
+        except Exception:
+            pass

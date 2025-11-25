@@ -2,21 +2,20 @@
 RL-based drone controller for gym-style environment interface
 """
 
-from typing import Optional, List, Tuple
+# Imports
 import numpy as np
+from typing import Optional
+import gymnasium as gym
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.misc_data import MiscData
-
-# New imports
-from swarm_rescue.solutions.my_drone_rl_framework import DroneRLEnv, RandomPolicy
-
-
+from swarm_rescue.simulation.utils import constants
+from swarm_rescue.solutions.my_drone_policies import RandomPolicy
+from swarm_rescue.solutions.rl_utils import ACTION_SPACE, build_obs, obs_to_tensor, to_commands_dict
 class MyDroneRL(DroneAbstract):
     """
     RL-based drone controller.
-    Wraps DroneRLEnv and executes actions every control step.
     """
 
     def __init__(self,
@@ -27,74 +26,115 @@ class MyDroneRL(DroneAbstract):
                         misc_data=misc_data, display_lidar_graph=False,
                         **kwargs)
 
-        # RL Environment wrapper
-        self.env = DroneRLEnv(self)
-        self.current_state = None
+        self.size_area = misc_data.size_area if misc_data else None
+        self.iteration:int = 0
+        self.droneReady = False
 
-        # RL Policy
-        self.policy = RandomPolicy()
+        self.msg_data = None
 
+        self.lidar_ray_angles = self.lidar().ray_angles
+        self.rescue_center_pos = None
+        self.init_position = None
+
+        self.show_log_info = False
+        self.show_log_warning = False
+        self.show_log_error = False
+        self.semantic_data = None
+        self.grasped = False
+
+        self.log_info("Drone is initialized")   
+
+        self.action_space = ACTION_SPACE
+
+        # Initialize RL Policy
+        self.model = None
+        self.policy = RandomPolicy(self.action_space)
+
+        # Save heuristics
+        self.prev_state = None
+        self.prev_action = None
         # Episode stats
         self.total_reward = 0.0
         self.steps = 0
 
-        # RL Env runs one step behind. Save previous states for reward calculation.
-        self.prev_state = None
-        self.prev_action = None
-    
-    def define_message_for_all(self) -> None:
+    def get_observation(self):
+        return build_obs(self)
+
+    def define_message_for_all(self):
         '''Define any custom messages to be sent to neighbors'''
-        pass
+        if not self.droneReady:
+            return None
+        self.msg_data = (self.identifier, (self.measured_gps_position(), self.measured_compass_angle()))
+        return self.msg_data
     
+    def is_collided(self):
+        """
+        Returns True if the drone collided a wall or other drones
+        """
+        if self.lidar_values() is None or self.semantic_values() is None:
+            return False
+
+        collided = False
+
+        dist = min(self.lidar_values())
+        semantic = self.semantic_values()
+        if len(semantic) == 0:
+            return dist < 30
+
+        idx = np.argmin([x.distance for x in semantic])
+
+        if dist < 30 and str(semantic[idx].entity_type) != "TypeEntity.WOUNDED_PERSON":
+            collided = True
+        return collided
+
+    def touch_human(self):
+        semantic = self.semantic_values()
+
+        if semantic is None:
+            return False
+
+        for x in semantic:
+            if x.distance < 30 and str(x.entity_type) == "TypeEntity.WOUNDED_PERSON":
+                return True
+
+        return False
+
+    def get_distance(self, pos_a, pos_b):
+        return np.sqrt((pos_a[0] - pos_b[0]) ** 2 + (pos_a[1] - pos_b[1]) ** 2)
+
+
     def control(self) -> CommandsDict:
         """
         Main control loop for RL-based drone policy.        
-        This function DEVIATES from the standard RL cycle:
-        (Since it implements a one-step behind logic to fit into the existing simulator control loop)
-    
-        1. Observe current state
-        2. Get feedback for previous step and compute previous step heuristics (saves one-step history)
-        3. Update internal stats and reset if episode ends for previous step
-        4. Select current action using learned policy
-        5. Execute action
-        
-        Returns:
-            CommandsDict: The commands to execute on the drone
         """
-        # Read current state
-        if self.current_state is None:
-            self.current_state = self.env.get_state()
+        # 1. Read current observation
+        obs = self.get_observation()
 
-        # Env based calculations 
-        # TODO: [Arnav] Find gripper action from state observation instead of policy
-        grasper = 0
-        # Compute previous step reward if applicable
-        # RL Env is one step behind the drone control loop
-        reward, done, info = 0.0, False, {}
-        if self.prev_state is not None and self.prev_action is not None:
-            # Proxy env step for the RL framework
-            reward, done, info = self.env.step(self.prev_state, self.prev_action, self.current_state) # TODO: implement info
+        if self.model is not None:
+            x = obs_to_tensor(obs)
+            action = self.model(x).detach().cpu().numpy()[0]
+        else: # Default to random policy
+            action = self.policy.select_action(obs)
 
-        # Reset if episode termination
-        if done:
-            # TODO log statistics here
-            self.total_reward = 0.0
-            self.steps = 0
-            self.prev_state = None
-            self.prev_action = None
-            self.current_state = None
+        action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # Track episode stats
-        self.total_reward += reward
-        self.steps += 1  
-
-        # Select action using policy
-        action = self.policy.select_action(self.current_state) 
-        action.grasper = grasper
-
-        # Save current state and action for next step reward calculation
-        self.prev_state = self.current_state
-        self.prev_action = action
-
-        return action.to_command_dict()
+        return to_commands_dict(action)
     
+    
+    def log_info(self, log=""):
+        if self.show_log_info:
+            print(
+                f"{str(self.iteration).zfill(5)}][Drone {self.identifier}] {log}"
+            )
+
+    def log_warning(self, log=""):
+        if self.show_log_warning:
+            print(
+                f"{str(self.iteration).zfill(5)}][Drone {self.identifier}] {log}"
+            )
+
+    def log_error(self, log=""):
+        if self.show_log_error:
+            print(
+                f"{str(self.iteration).zfill(5)}][Drone {self.identifier}] {log}"
+            )
