@@ -176,275 +176,130 @@ class DroneState:
 # ================================================================
 class DroneReward:
     """
-    Reward class that uses exact fields you specified:
-      - elapsed_timestep (from drone_abstract/state)
-      - elapsed_walltime (from drone_abstract/state)
-    Other repo-specific fields used unchanged:
-      - misc_data.size_area
-      - misc_data.max_timestep_limit
-      - misc_data.max_walltime_limit
-      - next_state.map_matrix (0 = unexplored)
-      - next_state.semantic_data (RescueCenter detection)
-      - next_state.lidar_scan (for wall avoidance)
+    Clean reward system:
+      - fixed timestep penalty
+      - pickup reward (grasp False->True)
+      - deliver reward if RescueCenter detected within (drone_size + 10)
+      - bad drop penalty
+      - health penalty
+      - exploration penalty using next_state.grid
+      - lidar-based wall penalty
     """
 
     def __init__(
         self,
-        misc_data: Optional[MiscData] = None,
         R_pickup: float = 50.0,
         R_deliver: float = 200.0,
         R_bad_drop: float = -100.0,
-        R_time_base: float = -0.1,
-        time_scale: float = 5.0,
+        R_timestep: float = -0.1,
         R_exploration_coeff: float = -10.0,
         R_health_loss_coeff: float = 1.0,
         lidar_safe_distance: float = 50.0,
         lidar_penalty_coeff: float = 20.0,
         lidar_power: float = 3.0,
     ):
-        # event rewards / penalties
-        self.R_pickup = float(R_pickup)
-        self.R_deliver = float(R_deliver)
-        self.R_bad_drop = float(R_bad_drop)
+        self.R_pickup = R_pickup
+        self.R_deliver = R_deliver
+        self.R_bad_drop = R_bad_drop
+        self.R_timestep = R_timestep
 
-        # time penalty (base and curvature)
-        self.R_time_base = float(R_time_base)    # should be negative
-        self.time_scale = float(time_scale)
+        self.R_exploration_coeff = R_exploration_coeff
+        self.R_health_loss_coeff = R_health_loss_coeff
 
-        # exploration & health
-        self.R_exploration_coeff = float(R_exploration_coeff)  # negative base
-        self.R_health_loss_coeff = float(R_health_loss_coeff)  # positive multiplier for lost health
+        self.lidar_safe_distance = lidar_safe_distance
+        self.lidar_penalty_coeff = lidar_penalty_coeff
+        self.lidar_power = lidar_power
 
-        # LIDAR params
-        self.lidar_safe_distance = float(lidar_safe_distance)
-        self.lidar_penalty_coeff = float(lidar_penalty_coeff)
-        self.lidar_power = float(lidar_power)
+    # ---------------------------------------------------------
+    # Semantic rescue detection
+    # ---------------------------------------------------------
+    def _semantic_reports_rescue(self, next_state, drone_size):
+        threshold = drone_size   # your requirement
 
-        # misc_data fields (read exactly as in repo)
-        self.size_area = None
-        self.max_timestep_limit = None
-        self.max_walltime_limit = None
-        if misc_data is not None:
-            self.size_area = getattr(misc_data, "size_area", None)
+        for ray in next_state.semantic_data:
             try:
-                self.max_timestep_limit = int(getattr(misc_data, "max_timestep_limit")) if hasattr(misc_data, "max_timestep_limit") else None
-            except Exception:
-                self.max_timestep_limit = None
-            try:
-                self.max_walltime_limit = float(getattr(misc_data, "max_walltime_limit")) if hasattr(misc_data, "max_walltime_limit") else None
-            except Exception:
-                self.max_walltime_limit = None
-
-    # ---------- helpers using the exact elapsed names you gave ----------
-    def _get_elapsed_timestep(self, state) -> Optional[int]:
-        """Read elapsed_timestep from state (exact name)."""
-        if state is None:
-            return None
-        if hasattr(state, "elapsed_timestep"):
-            try:
-                return int(getattr(state, "elapsed_timestep"))
-            except Exception:
-                return None
-        if isinstance(state, dict) and "elapsed_timestep" in state:
-            try:
-                return int(state["elapsed_timestep"])
-            except Exception:
-                return None
-        return None
-
-    def _get_elapsed_walltime(self, state) -> Optional[float]:
-        """Read elapsed_walltime from state (exact name)."""
-        if state is None:
-            return None
-        if hasattr(state, "elapsed_walltime"):
-            try:
-                return float(getattr(state, "elapsed_walltime"))
-            except Exception:
-                return None
-        if isinstance(state, dict) and "elapsed_walltime" in state:
-            try:
-                return float(state["elapsed_walltime"])
-            except Exception:
-                return None
-        return None
-
-    def _semantic_reports_rescue(self, next_state) -> bool:
-        """Return True if any semantic ray reports RescueCenter with distance == 0.0."""
-        semantic = getattr(next_state, "semantic_data", None)
-        if not semantic:
-            return False
-        for ray in semantic:
-            try:
-                et = ray["entity_type"] if isinstance(ray, dict) else getattr(ray, "entity_type", None)
-                dist = ray["distance"] if isinstance(ray, dict) else getattr(ray, "distance", None)
-            except Exception:
-                et = getattr(ray, "entity_type", None)
-                dist = getattr(ray, "distance", None)
-            try:
-                if et == "RescueCenter" and float(dist) == 0.0:
-                    return True
-            except Exception:
+                et = ray["entity_type"]
+                dist = float(ray["distance"])
+            except:
                 continue
+
+            if et == "RescueCenter" and dist <= threshold:
+                return True
+
         return False
 
-    def _lidar_penalty(self, next_state) -> float:
-        """
-        LIDAR safety penalty: near wall => negative penalty.
-        Smooth, steep "step-like" behavior using a power curve.
-        """
-        scan = getattr(next_state, "lidar_scan", None)
+    # ---------------------------------------------------------
+    # LIDAR penalty
+    # ---------------------------------------------------------
+    def _lidar_penalty(self, next_state):
+        scan = next_state.lidar_scan
+
         if scan is None or len(scan) == 0:
             return 0.0
+
         try:
             nearest = float(np.min(scan))
-        except Exception:
-            try:
-                nearest = float(min(scan))
-            except Exception:
-                return 0.0
+        except:
+            nearest = float(min(scan))
 
         if nearest >= self.lidar_safe_distance:
             return 0.0
-        normalized = max(0.0, 1.0 - (nearest / self.lidar_safe_distance))
-        penalty = - self.lidar_penalty_coeff * (normalized ** self.lidar_power)
-        return float(penalty)
 
-    # ---------- main calculate ----------
-    def calculate(self, current_state: DroneState, action: DroneAction, next_state: DroneState) -> float:
-        """
-        Compute scalar reward for transition (current_state -> next_state).
-        Uses exact elapsed_timestep & elapsed_walltime names from drone_abstract.
-        """
+        normalized = max(0.0, 1.0 - nearest / self.lidar_safe_distance)
+        return -self.lidar_penalty_coeff * (normalized ** self.lidar_power)
+
+    # ---------------------------------------------------------
+    # Main reward function
+    # ---------------------------------------------------------
+    def calculate(self, current_state, action, next_state):
+
         if current_state is None:
             return 0.0
 
-        # ----- 1) TIME: use both elapsed_timestep and elapsed_walltime (exact names) -----
-        elapsed_step = self._get_elapsed_timestep(next_state) or self._get_elapsed_timestep(current_state)
-        elapsed_wall = self._get_elapsed_walltime(next_state) or self._get_elapsed_walltime(current_state)
+        reward = 0.0
 
-        max_steps = self.max_timestep_limit
-        # fallback: use next_state attribute if misc_data didn't provide it
-        if max_steps is None and hasattr(next_state, "max_timestep_limit"):
-            try:
-                max_steps = int(getattr(next_state, "max_timestep_limit"))
-            except Exception:
-                max_steps = None
-        if max_steps is None and hasattr(current_state, "max_timestep_limit"):
-            try:
-                max_steps = int(getattr(current_state, "max_timestep_limit"))
-            except Exception:
-                max_steps = None
+        # -------- timestep penalty --------
+        reward += self.R_timestep
 
-        max_wall = self.max_walltime_limit
-        if max_wall is None and hasattr(next_state, "max_walltime_limit"):
-            try:
-                max_wall = float(getattr(next_state, "max_walltime_limit"))
-            except Exception:
-                max_wall = None
-        if max_wall is None and hasattr(current_state, "max_walltime_limit"):
-            try:
-                max_wall = float(getattr(current_state, "max_walltime_limit"))
-            except Exception:
-                max_wall = None
+        # -------- grasp transitions --------
+        prev_g = bool(current_state.grasped)
+        now_g = bool(next_state.grasped)
 
-        frac_step = None
-        if (elapsed_step is not None) and (max_steps is not None) and max_steps > 0:
-            frac_step = max(0.0, min(1.0, float(elapsed_step) / float(max_steps)))
-        frac_wall = None
-        if (elapsed_wall is not None) and (max_wall is not None) and max_wall > 0:
-            frac_wall = max(0.0, min(1.0, float(elapsed_wall) / float(max_wall)))
+        # pickup
+        if (not prev_g) and now_g:
+            reward += self.R_pickup
 
-        # conservative combine: use the larger fraction
-        if frac_step is None and frac_wall is None:
-            combined_frac = 0.0
-        elif frac_step is None:
-            combined_frac = frac_wall
-        elif frac_wall is None:
-            combined_frac = frac_step
-        else:
-            combined_frac = max(frac_step, frac_wall)
+        # drop
+        if prev_g and (not now_g):
 
-        try:
-            per_step_penalty = float(self.R_time_base) * math.exp(self.time_scale * combined_frac)
-        except Exception:
-            per_step_penalty = float(self.R_time_base)
+            # DIRECT DRONE SIZE FROM next_state._size_area
+            drone_w, drone_h = next_state._size_area
+            drone_size = max(drone_w, drone_h)
 
-        reward = float(per_step_penalty)
-
-        # ----- 2) Pickup detection (False -> True) -----
-        prev_grasp = bool(getattr(current_state, "grasped", False))
-        now_grasp = bool(getattr(next_state, "grasped", False))
-        if (not prev_grasp) and now_grasp:
-            reward += float(self.R_pickup)
-
-        # ----- 3) Drop detection (True -> False) and rescue detection -----
-        if prev_grasp and (not now_grasp):
-            in_rescue = self._semantic_reports_rescue(next_state)
-            if in_rescue:
-                reward += float(self.R_deliver)
+            # rescue center detection
+            if self._semantic_reports_rescue(next_state, drone_size):
+                reward += self.R_deliver
             else:
-                reward += float(self.R_bad_drop)
+                reward += self.R_bad_drop
 
-        # ----- 4) Health loss penalty -----
-        try:
-            prev_h = float(getattr(current_state, "health", DRONE_INITIAL_HEALTH))
-            next_h = float(getattr(next_state, "health", prev_h))
-            health_lost = max(0.0, prev_h - next_h)
-            if health_lost > 0.0:
-                reward -= (self.R_health_loss_coeff * health_lost)
-        except Exception:
-            pass
+        # -------- health penalty --------
+        prev_h = float(current_state.health)
+        next_h = float(next_state.health)
+        lost = max(0.0, prev_h - next_h)
 
-        # ----- 5) Exploration penalty using next_state.map_matrix and misc_data.size_area -----
-        exploration_contribution = 0.0
-        try:
-            mm = getattr(next_state, "map_matrix", None)
-            total_pixels = None
-            # prefer misc_data.size_area (tuple width, height)
-            if self.size_area is not None and isinstance(self.size_area, (tuple, list)) and len(self.size_area) >= 2:
-                try:
-                    total_pixels = int(float(self.size_area[0]) * float(self.size_area[1]))
-                except Exception:
-                    total_pixels = None
-            # fallback: next_state.size_area
-            if total_pixels is None and hasattr(next_state, "size_area"):
-                try:
-                    sa = getattr(next_state, "size_area")
-                    if isinstance(sa, (tuple, list)) and len(sa) >= 2:
-                        total_pixels = int(float(sa[0]) * float(sa[1]))
-                except Exception:
-                    total_pixels = None
-            # fallback: infer from map_matrix shape
-            if total_pixels is None and (mm is not None):
-                try:
-                    total_pixels = int(mm.shape[0]) * int(mm.shape[1])
-                except Exception:
-                    total_pixels = None
+        reward -= self.R_health_loss_coeff * lost
 
-            if (mm is not None) and (total_pixels is not None) and total_pixels > 0:
-                try:
-                    num_unexplored = float((mm == 0).sum())
-                except Exception:
-                    try:
-                        num_unexplored = float(sum(1 for row in mm for v in row if v == 0))
-                    except Exception:
-                        num_unexplored = float(total_pixels)
-                frac_unexplored = max(0.0, min(1.0, num_unexplored / float(total_pixels)))
-                exploration_contribution = float(self.R_exploration_coeff) * frac_unexplored
-            else:
-                # conservative fallback
-                exploration_contribution = float(self.R_exploration_coeff)
-        except Exception:
-            exploration_contribution = float(self.R_exploration_coeff)
+        # -------- exploration penalty (using grid) --------
+        grid = getattr(next_state, "grid", None)
 
-        reward += float(exploration_contribution)
+        if grid is not None:
+            total = grid.shape[0] * grid.shape[1]
+            if total > 0:
+                unexplored = float((grid == 0).sum())
+                reward += self.R_exploration_coeff * (unexplored / total)
 
-        # ----- 6) LIDAR wall avoidance penalty -----
-        try:
-            reward += float(self._lidar_penalty(next_state))
-        except Exception:
-            # ignore if lidar fails
-            pass
+        # -------- lidar penalty --------
+        reward += self._lidar_penalty(next_state)
 
         return float(reward)
 
