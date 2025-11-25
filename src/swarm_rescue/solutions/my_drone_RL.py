@@ -6,6 +6,7 @@ RL-based drone controller for gym-style environment interface
 import numpy as np
 from typing import Optional
 import gymnasium as gym
+import arcade
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
@@ -83,8 +84,10 @@ class MyDroneRL(DroneAbstract):
 
         idx = np.argmin([x.distance for x in semantic])
 
-        if dist < 30 and str(semantic[idx].entity_type) != "TypeEntity.WOUNDED_PERSON":
-            collided = True
+        if dist < 30:
+            entity_type = str(semantic[idx].entity_type)
+            if entity_type != "TypeEntity.WOUNDED_PERSON" and entity_type != "TypeEntity.RESCUE_CENTER":
+                collided = True
         return collided
 
     def touch_human(self):

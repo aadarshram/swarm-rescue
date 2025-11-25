@@ -28,6 +28,20 @@ class RandomPolicy:
         return self.action_space.sample()
 
 
+class FixedPolicy:
+    """Fixed policy for manual testing"""
+    
+    def __init__(self, action_space, action=None):
+        self.action_space = action_space
+        # Default to moving laterally: [forward, lateral, rotation, grasper]
+        # Set lateral to 1.0 (left)
+        self.action = action if action is not None else np.array([0.0, -1.0, 0.0, 0.0])
+    
+    def select_action(self, obs):
+        """Return fixed action"""
+        return self.action
+
+
 def train_random_policy(
     num_episodes: int = 10,
     max_steps: int = 500,
@@ -162,16 +176,22 @@ def eval_policy(
     print("-" * 60)
     
     # Create environment
-    render_mode = "rgb_array" if render_video else ("human" if not headless else None)
+    # Initialize with render_mode=None to avoid creating a window immediately
+    # We will set it before the first reset
+    target_render_mode = "rgb_array" if render_video else ("human" if not headless else None)
+    
     env = DroneRLEnv(
         map_name=map_name,
-        render_mode=render_mode,
+        render_mode=None, # Defer GUI creation
         max_steps=max_steps,
         fixed_step=fixed_step,
         use_exp_map=use_exp_map,
         headless=headless,
         drone_cls=MyDroneRL,
     )
+    
+    # Set the actual render mode so reset() will create the GUI
+    env.render_mode = target_render_mode
     
     # Evaluation statistics
     episode_rewards = []
@@ -198,6 +218,8 @@ def eval_policy(
 
             # Update GUI if rendering
             # Handled by DroneRLEnv.step() internally for smoother animation
+            
+            print(f"    Step {episode_length}: Reward = {reward:.4f}")
 
             episode_reward += reward
             episode_length += 1
@@ -265,6 +287,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-headless", action="store_true", help="Show GUI (slower)")
     parser.add_argument("--render-video", action="store_true", help="Save video frames during eval")
     
+    parser.add_argument("--policy", type=str, default="random", choices=["random", "fixed"],
+                        help="Policy to use in eval mode")
+    
     args = parser.parse_args()
     
     if args.mode == "train":
@@ -277,15 +302,14 @@ if __name__ == "__main__":
             use_exp_map=args.use_exp_map,
         )
     else:  # eval mode
-        # Create environment to get action space
-        temp_env = DroneRLEnv(
-            map_name=args.map,
-            headless=True,
-            drone_cls=MyDroneRL,
-        )
-        policy = RandomPolicy(temp_env.action_space)
-        temp_env.close()
+        # Import ACTION_SPACE directly to avoid creating a temp env
+        from swarm_rescue.solutions.rl_utils import ACTION_SPACE
         
+        if args.policy == "fixed":
+            policy = FixedPolicy(ACTION_SPACE)
+        else:
+            policy = RandomPolicy(ACTION_SPACE)
+            
         # Run evaluation
         eval_policy(
             policy=policy,
