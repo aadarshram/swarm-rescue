@@ -117,7 +117,7 @@ class OccupancyGrid(Grid):
                 x = pose.position[0] + d*np.cos(a)
                 y = pose.position[1] + d*np.sin(a)
                 self.add_points(x, y, PERSON_VALUE)
-            if (data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER and not data.grasped):
+            if (data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER):
                 d = data.distance
                 a = data.angle + pose.orientation
                 x = pose.position[0] + d*np.cos(a)
@@ -134,97 +134,22 @@ class OccupancyGrid(Grid):
                                       interpolation=cv2.INTER_NEAREST)
 
 
-'''class MyDroneMapping(DroneAbstract):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+def find_pose(drone:DroneAbstract, pose = Pose()):
+    gps_sensor = drone.gps_values()
+    compass_sensor = drone.compass_values()
+    odometer = drone.odometer_values()
 
-        self.iteration: int = 0
+    # Finding Pose, assuming GPS gives absolute position. In no gps zones, we use odom.
+    if gps_sensor is not None and compass_sensor is not None: 
+        pose = Pose(np.asarray(gps_sensor.position),compass_sensor.angle)
+    elif odometer is not None:
+        dist_travel = getattr(odometer, "delta_distance", 0.0)
+        alpha = getattr(odometer, "delta_alpha", 0.0)
+        theta = getattr(odometer, "delta_theta", 0.0)
 
-        self.estimated_pose = Pose()
-
-        resolution = 8
-        self.grid = OccupancyGrid(size_area_world=self.size_area,
-                                  resolution=resolution,
-                                  lidar=self.lidar())
-
-    def define_message_for_all(self):
-        """
-        Here, we don't need communication...
-        """
-        pass
-
-    def control(self) -> CommandsDict:
-        """
-        We only send a command to do nothing
-        """
-        command: CommandsDict = {"forward": 0.0,
-                                 "lateral": 0.0,
-                                 "rotation": 0.0,
-                                 "grasper": 0}
-
-        # increment the iteration counter
-        self.iteration += 1
-
-        self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
-                                   self.measured_compass_angle())
-        # self.estimated_pose = Pose(np.asarray(self.true_position()),
-        #                            self.true_angle())
-
-        self.grid.update_grid(pose=self.estimated_pose)
-        if self.iteration % 5 == 0:
-            self.grid.display(self.grid.grid,
-                              self.estimated_pose,
-                              title="occupancy grid")
-            self.grid.display(self.grid.zoomed_grid,
-                              self.estimated_pose,
-                              title="zoomed occupancy grid")
-            # pass
-
-        return command
-
-
-class MyMapMapping(MapAbstract):
-
-    def __init__(self, drone_type: Type[DroneAbstract]):
-        super().__init__(drone_type=drone_type)
-
-        # PARAMETERS MAP
-        self._size_area = (1113, 750)
-
-        self._rescue_center = RescueCenter(size=(210, 90))
-        self._rescue_center_pos = ((440, 315), 0)
-
-        self._number_drones = 1
-        self._drones_pos = [((-50, 0), 0)]
-        self._drones = []
-
-        self._playground = ClosedPlayground(size=self._size_area)
-
-        self._playground.add(self._rescue_center, self._rescue_center_pos)
-
-        add_walls(self._playground)
-        add_boxes(self._playground)
-
-        # POSITIONS OF THE DRONES
-        misc_data = MiscData(size_area=self._size_area,
-                             number_drones=self._number_drones,
-                             max_timestep_limit=self._max_timestep_limit,
-                             max_walltime_limit=self._max_walltime_limit)
-        for i in range(self._number_drones):
-            drone = drone_type(identifier=i, misc_data=misc_data)
-            self._drones.append(drone)
-            self._playground.add(drone, self._drones_pos[i])
-
-  
-def main():
-    the_map = MyMapMapping(drone_type=MyDroneMapping)
-
-    gui = GuiSR(the_map=the_map,
-                use_keyboard=True,
-                )
-    gui.run()
-
-
-if __name__ == '__main__':
-    main()
-'''
+        beta = pose.orientation + alpha
+        x = pose.position[0] + dist_travel*np.cos(beta)
+        y = pose.position[1] + dist_travel*np.sin(beta)
+        angle = pose.orientation + theta
+        pose = Pose(np.asarray((x,y)),angle)
+    return pose

@@ -17,7 +17,10 @@ from swarm_rescue.simulation.utils.constants import MAX_RANGE_LIDAR_SENSOR
 from swarm_rescue.solutions.my_drone_RL import MyDroneRL
 from swarm_rescue.maps.map_medium_01 import MapMedium01
 from swarm_rescue.maps.map_intermediate_01 import MapIntermediate01
-from swarm_rescue.solutions.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, to_commands_dict
+from swarm_rescue.solutions.rl_utils import ACTION_SPACE, build_observation_space, build_obs, to_commands_dict
+from swarm_rescue.solutions.mapping import OccupancyGrid
+from swarm_rescue.simulation.utils.pose import Pose
+
 
 map_dict = {
     "Medium01": MapMedium01,
@@ -92,7 +95,7 @@ class DroneRLEnv(gym.Env):
 
         self.action_space = ACTION_SPACE
         
-        self.observation_space = OBSERVATION_SPACE
+        self.observation_space = None #build_observation_space()
         
         # Bookkeeping
         self.ep_count = 0
@@ -116,6 +119,7 @@ class DroneRLEnv(gym.Env):
 
     def _get_obs(self):
         obs = build_obs(self._agent)
+        self.observation_space = build_observation_space(self._agent.size_area)
         return obs
 
     def _get_info(self):

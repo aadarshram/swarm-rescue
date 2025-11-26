@@ -13,6 +13,7 @@ from swarm_rescue.simulation.utils.misc_data import MiscData
 from swarm_rescue.simulation.utils import constants
 from swarm_rescue.solutions.my_drone_policies import RandomPolicy
 from swarm_rescue.solutions.rl_utils import ACTION_SPACE, build_obs, obs_to_tensor, to_commands_dict
+
 class MyDroneRL(DroneAbstract):
     """
     RL-based drone controller.
@@ -56,6 +57,9 @@ class MyDroneRL(DroneAbstract):
         # Episode stats
         self.total_reward = 0.0
         self.steps = 0
+
+        self.pose = None
+        self.grid = None
 
     def get_observation(self):
         return build_obs(self)
