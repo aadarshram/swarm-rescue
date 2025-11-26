@@ -12,6 +12,8 @@ ACTION_SPACE = gym.spaces.Box(
     high=np.array([ 1,  1,  1, 1], dtype=np.float32),
     shape=(4,), dtype=np.float32
 )
+
+# Arnav says this is new observation space builder
 def build_observation_space(size_area) -> spaces.Dict:
     """Build observation space for RL environment."""
     return spaces.Dict(
@@ -25,6 +27,7 @@ def build_observation_space(size_area) -> spaces.Dict:
             "grasper": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         }
     )
+# Arnav says this can be removed, but kept for reference
 # OBSERVATION_SPACE = spaces.Dict(
 #             {
 #                 "grid": spaces.Box(low=0.0, high=1.0, shape=(constants.RESOLUTION_LIDAR_SENSOR-1,), dtype=np.float32), # sub 1 to exclude max range ray (repeated)
@@ -49,7 +52,7 @@ def process_semantic(semantic_values):
     return np.array(rows, dtype=np.float32)
 
 
-
+# Arnav says this is new build_obs function, replacing old one
 def build_obs(drone):
     """Convert raw drone sensors → RLEnv format"""
     # lidar = np.array(drone.lidar_values(), dtype=np.float32)
@@ -92,6 +95,7 @@ def build_obs(drone):
 
     return obs
 
+# Arnav says this can be removed, but kept for reference with some useless additions
 def flatten_observation(obs):
     vec = np.concatenate([
         obs["grid"],

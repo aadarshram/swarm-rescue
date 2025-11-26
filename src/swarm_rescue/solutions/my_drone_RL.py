@@ -58,8 +58,8 @@ class MyDroneRL(DroneAbstract):
         self.total_reward = 0.0
         self.steps = 0
 
-        self.pose = None
-        self.grid = None
+        self.pose = None # Arnav
+        self.grid = None # Arnav
 
     def get_observation(self):
         return build_obs(self)
