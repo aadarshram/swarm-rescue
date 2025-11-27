@@ -4,16 +4,16 @@ Implements OpenAI Gym style environment, reward system, and policy interfaces.
 """
 
 import gc
-import os
 import numpy as np
-from typing import Optional, Dict, Tuple
+from typing import Optional
 
 import gymnasium as gym
-from gymnasium import spaces
 import arcade
-# from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
-from swarm_rescue.simulation.utils.constants import MAX_RANGE_LIDAR_SENSOR
+
+from swarm_rescue.simulation.utils import constants
 from swarm_rescue.solutions.my_drone_RL import MyDroneRL
+from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
+# Maps
 from swarm_rescue.maps.map_medium_01 import MapMedium01
 from swarm_rescue.maps.map_intermediate_01 import MapIntermediate01
 from swarm_rescue.solutions.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, to_commands_dict
@@ -26,7 +26,7 @@ map_dict = {
 class DroneRLEnv(gym.Env):
     """
     Variables:
-    - max_steps: total timesteps to run before terminate the episdoe
+    - max_steps: total timesteps to run before terminate the episode
     - fixed_steps: number of steps to step the playground per command produce by the agent
     - map_name: select the maps to run in.
 
@@ -60,12 +60,12 @@ class DroneRLEnv(gym.Env):
         render_mode: str = "rgb_array",
         max_steps: int = 100,
         fixed_step: int = 20,
-        use_exp_map: bool = False,
         headless: bool = False,
         drone_cls=MyDroneRL,
     ):
         super().__init__()
 
+        # Initialize map
         if map_name in map_dict:
             self.map_name = map_name
             self.map_cls = map_dict[map_name]
@@ -76,29 +76,26 @@ class DroneRLEnv(gym.Env):
         self.render_mode = render_mode
         self.max_steps = max_steps
         self.fixed_step = fixed_step
-        self.use_exp_map = use_exp_map
-        self.drone_cls = drone_cls
         self.headless = bool(headless)
-
         self._map = None
         self._playground = None
-        self._agent = None
         self.map_size = None
-
-        self.fixed_step = fixed_step
         self.total_rescued = 0
-        self.map_size = None
 
+        # Drone config
+        self.drone_cls = drone_cls
+        self._agent = None
         self.action_space = ACTION_SPACE
-        
         self.observation_space = OBSERVATION_SPACE
-        
+                        
         # Bookkeeping
         self.ep_count = 0
         self.current_step = 0
         self.total_rescued = 0
         self.frames = []
         self.last_exp_score = None
+        self.prev_obs = None
+        self.prev_health = None
 
         self.re_init()
 
@@ -106,13 +103,11 @@ class DroneRLEnv(gym.Env):
         """Convert action array to CommandsDict format expected by the simulator"""
         # Clip values to valid range [-1, 1] for continuous, [0, 1] for grasper
         action = np.clip(action, [-1, -1, -1, 0], [1, 1, 1, 1])
-        # Convert to commands using rl_utils helper
         return to_commands_dict(action)
         
     def get_distance(self, pos_a, pos_b):
         return np.sqrt((pos_a[0] - pos_b[0]) ** 2 + (pos_a[1] - pos_b[1]) ** 2)
       
-
     def _get_obs(self):
         obs = build_obs(self._agent)
         return obs
@@ -131,12 +126,16 @@ class DroneRLEnv(gym.Env):
         
         # Get drone position
         if self._agent is not None:
-            info["drones_true_pos"] = self._agent.measured_gps_position()
-        
+            info["drones_true_pos"] = self._agent.true_gps_position()
+        # Get drone orientation
+            info["drones_true_angle"] = self._agent.true_compass_angle()
+            info["drone_true_velocity"] = self._agent.true_velocity()
+            info["drone_true_angular_velocity"] = self._agent.true_angular_velocity()
+            # TODO: Add more true values here as info to debug against policy
         return info
 
     def re_init(self):
-        """(Re)create map, playground and main agent. Uses drone_cls with training mode off."""
+        """(Re)create map, playground and main agent"""
         
         # Clean up previous resources
         if hasattr(self, 'gui') and self.gui is not None:
@@ -162,18 +161,16 @@ class DroneRLEnv(gym.Env):
         
         # Create new map with the drone class
         self._map = self.map_cls(drone_type=self.drone_cls)
-        
         # Get map properties
         self.map_size = self._map.size_area
         self._playground = self._map.playground
         
-        # Get the first drone as the agent (single agent for now)
+        # Get the first drone as the agent (single agent for now) # TODO: Extend to multi-agent later
         self._agent = self._playground.agents[0] if self._playground.agents else None
         
         # Create GUI for rendering (can be headless)
         if self.render_mode is not None:
             try:
-                from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
                 self.gui = GuiSR(the_map=self._map, headless=self.headless)
             except Exception as e:
                 print(f"Warning: Could not create GuiSR: {e}")
@@ -182,7 +179,7 @@ class DroneRLEnv(gym.Env):
             self.gui = None
         
         # Reset exploration tracking
-        if hasattr(self._map, 'explored_map'):
+        if hasattr(self._map, 'explored_map'): # TODO: Find a way to visualize this to know how our agent is exploring
             self._map.explored_map.reset()
             self.last_exp_score = self._map.explored_map.score()
 
@@ -197,6 +194,8 @@ class DroneRLEnv(gym.Env):
         self.current_step = 0
         self.total_rescued = 0
         self.ep_count += 1
+        self.prev_obs = None
+        self.prev_health = None
 
         # Step the playground once to initialize sensors (they return NaN initially)
         if self._playground is not None and self._agent is not None:
@@ -230,20 +229,12 @@ class DroneRLEnv(gym.Env):
 
         terminated, truncated = False, False
 
-        # ROTATION PENALTY
-        reward = -0.5 - np.abs(action[2])  # discourage excessive rotation
-
-        # Save initial distances to rescue center for reward calculation
-        prev_distances = []
-        wounded_persons = getattr(self._map, "_wounded_persons", [])
-        rescue_center_pos = getattr(self._map, "_rescue_center_pos", None)
-        
-        if rescue_center_pos and len(rescue_center_pos) > 0:
-            for person in wounded_persons:
-                prev_distances.append(self.get_distance(person.position, rescue_center_pos[0]))
+        # Store previous state for reward calculation
+        prev_grasped = len(self._agent.grasped_wounded_persons()) > 0 if self._agent else False
+        prev_health = self._agent.drone_health if self._agent and hasattr(self._agent, 'drone_health') else constants.DRONE_INITIAL_HEALTH
 
         # Run several simulator ticks per action (like GuiSR.on_update loop)
-        while counter < self.fixed_step and not done:
+        while counter < self.fixed_step and not done: # TODO: Is this fixed step business correct. if so what value is correct?
             # Construct command dict for the agent
             cmd = {self._agent: self.construct_action(action)}
             
@@ -275,16 +266,19 @@ class DroneRLEnv(gym.Env):
                     truncated = True
                     break
 
-            # Track rescues (drones get reward attribute when they rescue someone)
-            if self._agent is not None and hasattr(self._agent, "reward"):
-                if self._agent.reward != 0:
-                    self.total_rescued += int(self._agent.reward)
-            
             # Check if all wounded persons rescued (termination condition)
+            # Or terminates if times up
             total_wounded = getattr(self._map, "_number_wounded_persons", 0)
             if self.total_rescued >= total_wounded and total_wounded > 0:
-                reward += 50.0
                 terminated = True
+                break
+            if self._agent.elapsed_timestep >= self._agent._misc_data.max_timestep_limit:
+                terminated = True
+                truncated = True
+                break
+            if self._agent.elapsed_walltime >= self._agent._misc_data.max_walltime_limit:
+                terminated = True
+                truncated = True
                 break
 
             # Capture frames for video if needed
@@ -296,26 +290,15 @@ class DroneRLEnv(gym.Env):
             
             counter += 1
 
-        # Add collision and touch rewards (if agent has these methods)
-        if self._agent is not None:
-            if hasattr(self._agent, "is_collided"):
-                reward -= float(self._agent.is_collided())
-            if hasattr(self._agent, "touch_human"):
-                reward += float(self._agent.touch_human())
+        # Calculate reward
+        reward = self._calculate_reward(prev_grasped, prev_health, action)
 
-        # Distance-based reward: encourage moving wounded closer to rescue
-        if rescue_center_pos and len(rescue_center_pos) > 0:
-            delta_distances = 0.0
-            for idx, person in enumerate(wounded_persons):
-                new_d = self.get_distance(person.position, rescue_center_pos[0])
-                old_d = prev_distances[idx] if idx < len(prev_distances) else new_d
-                delta_distances += (new_d - old_d)
-            reward -= delta_distances / 5.0
+        # total_wounded = getattr(self._map, "_number_wounded_persons", 0) # Info for debug        
 
         self.current_step += 1
 
         # Check for episode truncation
-        if self.current_step >= self.max_steps:
+        if self.current_step >= self.max_steps: # TODO: Is this correct?
             truncated = True
             reward -= 20.0
 
@@ -331,6 +314,14 @@ class DroneRLEnv(gym.Env):
             info["ep_frames"] = list(self.frames)
 
         return obs, float(reward), bool(terminated), bool(truncated), info
+
+    def _calculate_reward(self, prev_grasped, prev_health, action):
+        """Calculate comprehensive reward based on multiple factors"""
+
+        reward = 0.0
+        # Timestep penalty 
+        reward += -0.01
+        return reward
 
     def close(self):
         try:

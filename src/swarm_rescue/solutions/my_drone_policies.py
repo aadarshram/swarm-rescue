@@ -1,4 +1,6 @@
-
+'''
+Definitons of custom drone policies. (RL based loaded from model or hardcoded logical policies)
+'''
 class RandomPolicy:
     """
     Random policy generating actions compatible with DroneRLEnv.
@@ -9,6 +11,6 @@ class RandomPolicy:
     def __init__(self, action_space):
         self.action_space = action_space
 
-    def select_action(self, state):
+    def predict(self, state, **kwargs):
         # Sample from the action space directly (cleanest way)
         return self.action_space.sample()
