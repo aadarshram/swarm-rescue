@@ -55,7 +55,7 @@ class MyDroneFSM(DroneAbstract):
         self.target_wounded_position = None
         self.claimed_wounded_positions = {}  # {drone_id: wounded_position}
         
-        # Random exploration variables
+        # Random exploration fallback
         self.counterStraight = 0
         self.angleStopTurning = random.uniform(-math.pi, math.pi)
         self.distStopStraight = random.uniform(10, 50)
@@ -64,14 +64,16 @@ class MyDroneFSM(DroneAbstract):
     def define_message_for_all(self):
         """
         Communication between drones controlled by same FSM.
-        Message format: (drone_id, (state, rescue_center_pos, target_wounded_pos))
+        Message format: (drone_id, (state, rescue_center_pos, target_wounded_pos, current_pos))
         """
+        current_pos = self.measured_gps_position()
         msg_data = (
             self.identifier,
             (
                 self.state.value,  # Current state
                 self.rescue_center_position if self.found_rescue_center else None,
-                self.target_wounded_position  # Which wounded person I'm targeting
+                self.target_wounded_position,  # Which wounded person I'm targeting
+                current_pos  # My current position for swarm spreading TODO
             )
         )
         return msg_data
@@ -81,19 +83,20 @@ class MyDroneFSM(DroneAbstract):
         Process messages from other drones to:
         1. Learn rescue center location from others
         2. Know which wounded persons are claimed by other drones
+        3. Track other drones' positions to avoid clustering
         """
         if not self.communicator:
             return
         
         received_messages = self.communicator.received_messages
         
-        # Clear old claims
+        # Clear old data
         self.claimed_wounded_positions.clear()
         
         for msg in received_messages:
             message = msg[1]
             other_drone_id = message[0]
-            other_state, other_rescue_pos, other_target_wounded = message[1]
+            other_state, other_rescue_pos, other_target_wounded, other_position = message[1]
             
             # Learn rescue center location from other drones
             if other_rescue_pos is not None and not self.found_rescue_center:
@@ -104,8 +107,8 @@ class MyDroneFSM(DroneAbstract):
             # Track which wounded persons are claimed by other drones
             if other_target_wounded is not None:
                 self.claimed_wounded_positions[other_drone_id] = other_target_wounded
-            
 
+    
     def is_wounded_claimed(self, wounded_position, tolerance=50.0):
         """
         Check if a wounded person at the given position is already claimed by another drone.
@@ -263,9 +266,9 @@ class MyDroneFSM(DroneAbstract):
             # Save rescue center position if not already saved
             if not self.found_rescue_center:
                 self.found_rescue_center = True
-                current_pos = self.true_position()
+                current_pos = self.measured_gps_position()
                 # Estimate rescue center position
-                angle_abs = self.true_angle() + mean_angle
+                angle_abs = self.measured_compass_angle() + mean_angle
                 self.rescue_center_position = (
                     current_pos[0] + mean_distance * math.cos(angle_abs),
                     current_pos[1] + mean_distance * math.sin(angle_abs)
@@ -290,15 +293,35 @@ class MyDroneFSM(DroneAbstract):
     def process_semantic_sensor_col(self):
         '''
         Process semantic sensor to find collision with other drones.
+        Returns: (collision_detected, repulsion_command)
         '''
         detection_semantic = self.semantic_values()
         if detection_semantic is None:
-            return False
+            return False, None
+        
+        closest_drone_distance = float('inf')
+        closest_drone_angle = 0.0
+        collision = False
+        
         for data in detection_semantic:
             if data.entity_type == DroneSemanticSensor.TypeEntity.DRONE:
                 if data.distance < 80:
-                    return True
-        return False
+                    collision = True
+                if data.distance < closest_drone_distance:
+                    closest_drone_distance = data.distance
+                    closest_drone_angle = data.angle
+        
+        # Create repulsion command if drone is too close
+        repulsion_command = None
+        if collision and closest_drone_distance < 80:
+            # Turn away from the closest drone
+            repulsion_command = {
+                "forward": 0.3,
+                "lateral": 0.0,
+                "rotation": -1.0 if closest_drone_angle > 0 else 1.0
+            }
+        
+        return collision, repulsion_command
     
     def navigate_to_start(self) -> CommandsDict:
         """
@@ -342,7 +365,7 @@ class MyDroneFSM(DroneAbstract):
             command["forward"] = 0.2
         
         return command
-
+    
     def control_random_search(self) -> CommandsDict:
         """
         Random exploration with obstacle avoidance.
@@ -353,7 +376,13 @@ class MyDroneFSM(DroneAbstract):
         command_straight = {"forward": 1.0, "lateral": 0.0, "rotation": 0.0}
         command_turn = {"forward": 0.0, "lateral": 0.0, "rotation": 1.0}
 
-        collided = self.process_lidar_sensor() or self.process_semantic_sensor_col()
+        drone_collision, repulsion_cmd = self.process_semantic_sensor_col()
+        
+        # If drone is very close, use repulsion command
+        if repulsion_cmd is not None:
+            return repulsion_cmd
+        
+        collided = self.process_lidar_sensor() or drone_collision
         self.counterStraight += 1
 
         # Start turning if we hit an obstacle or detect a nearby drone
@@ -450,7 +479,6 @@ class MyDroneFSM(DroneAbstract):
 
         # STATE ACTIONS
         if self.state == self.State.SEARCHING_WOUNDED:
-            # Random exploration to find wounded persons
             command = self.control_random_search()
             command["grasper"] = 0
 
