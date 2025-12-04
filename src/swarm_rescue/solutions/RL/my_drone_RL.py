@@ -7,17 +7,28 @@ import numpy as np
 from typing import Optional
 import gymnasium as gym
 import arcade
+from enum import Enum
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.misc_data import MiscData
 from swarm_rescue.solutions.my_drone_policies import RandomPolicy
-from swarm_rescue.solutions.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, obs_to_tensor, to_commands_dict, flatten_observation
+from swarm_rescue.solutions.RL.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, obs_to_tensor, to_commands_dict, flatten_observation
 
 class MyDroneRL(DroneAbstract):
     """
     RL-based drone controller. Uses RL policy to select actions based on observations.
     """
+
+    class HLState(Enum):
+        """
+        High-level state of drone. Useful for high-level policy
+        """
+        SEARCHING_WOUNDED = 0
+        GRASPING_WOUNDED = 1
+        SEARCHING_RESCUE_CENTER = 2
+        DROPPING_RESCUE_CENTER = 3
+        RETURN_TO_BASE = 4
 
     def __init__(self,
                  identifier: Optional[int] = None,
@@ -36,6 +47,7 @@ class MyDroneRL(DroneAbstract):
         # Avoid redundant attributes
         
         # Define drones action and observation spaces
+        self.hl_state = self.HLState
         self.action_space = ACTION_SPACE
         self.observation_space = OBSERVATION_SPACE
         # Initialize drone brain
@@ -58,8 +70,8 @@ class MyDroneRL(DroneAbstract):
     def load_model(self, model_path):
         """Load a trained SB3 model and configure observation space"""
         try:
-            from stable_baselines3 import PPO # Assume PPO for now
-            self.model = PPO.load(model_path)
+            from stable_baselines3 import A2C # Assume A2C for now
+            self.model = A2C.load(model_path)
         except Exception as e:
             self.model = None
 
@@ -86,7 +98,7 @@ class MyDroneRL(DroneAbstract):
         semantic = self.semantic_values()
         idx = np.argmin([x.distance for x in semantic])
 
-        if dist < 30:# Collision with wall or drone
+        if dist < 40:# Collision with wall or drone
             entity_type = str(semantic[idx].entity_type)
             if entity_type != "TypeEntity.WOUNDED_PERSON" and entity_type != "TypeEntity.RESCUE_CENTER":
                 collided = True
@@ -95,16 +107,26 @@ class MyDroneRL(DroneAbstract):
             # use self.policy for any override to self.model actions
         return collided
 
-    def touch_human(self):
-        '''Returns True if the drone is close enough to a wounded person'''
+    def found_wounded(self):
+        found_wounded = False
         semantic = self.semantic_values()
-        if semantic is None:
-            return False
-        for x in semantic:
-            if x.distance < 30 and str(x.entity_type) == "TypeEntity.WOUNDED_PERSON":
-                return True
-        return False
-
+        if self.hl_state is self.HLState.SEARCHING_WOUNDED or self.hl_state is self.HLState.GRASPING_WOUNDED and semantic is not None:
+            scores = []
+            for x in semantic:
+                # If wounded person detected but not help by other drone
+                if (str(x.entity_type) == "TypeEntity.WOUNDED_PERSON" and not x.grasped):
+                    found_wounded = True
+                    v = (x.angle * x.angle) + \
+                        (x.distance * x.distance / 10 ** 5)
+                    scores.append((v, x.angle, x.distance))
+            best_score = 1e6
+            for score in scores:
+                if score[0] < best_score:
+                    best_score = score[0]
+                    best_angle = score[1]
+            return found_wounded, best_angle
+        return found_wounded, -1.0
+    
     def get_distance(self, pos_a, pos_b):
         return np.sqrt((pos_a[0] - pos_b[0]) ** 2 + (pos_a[1] - pos_b[1]) ** 2)
 
@@ -123,11 +145,16 @@ class MyDroneRL(DroneAbstract):
         # Read current observation
         obs = self.get_observation()
 
-        if self.model is not None:
-            flat_obs = flatten_observation(obs)
+        if self.model is not None: # Then assume its an RL policy
+            flat_obs = flatten_observation(obs) # For input into MLP policy
             action, _states = self.model.predict(flat_obs, deterministic=True)
         else: # Default to random policy
             action = self.policy.predict(obs)
 
         action = np.clip(action, self.action_space.low, self.action_space.high)
+
+        # Add the grasper action separately (handled via other logic)
+        grasper_action = 1.0 if self.found_wounded()[0] else 0.0
+        action = np.append(action, grasper_action)
+        # Use wounded person angle for override policy TODO
         return to_commands_dict(action)

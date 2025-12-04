@@ -1,5 +1,5 @@
 import numpy as np
-# import torch
+import torch
 import gymnasium as gym
 from gymnasium import spaces
 from swarm_rescue.simulation.drone.controller import CommandsDict
@@ -7,48 +7,22 @@ from swarm_rescue.simulation.utils import constants
 # Note: We implement our own find_pose here instead of importing from mapping.py
 # because the sensor return types are different (numpy arrays vs objects)
 
-# Global action space for each drone
+# Action space should be symmetric for better learning
+# Grasper action is handled via separate logic
 ACTION_SPACE = gym.spaces.Box(
-    low=np.array([-1, -1, -1, 0], dtype=np.float32),
-    high=np.array([ 1,  1,  1, 1], dtype=np.float32),
-    shape=(4,), dtype=np.float32
+    low=np.array([-1, -1, -1], dtype=np.float32), # Forward, Lateral, Rotation
+    high=np.array([ 1,  1, 1], dtype=np.float32),
+    shape=(3,), dtype=np.float32
 )
 
-OBSERVATION_SPACE = spaces.Dict(
-        {
-            "lidar": spaces.Box(
-                low=0.0, 
-                high=1.0, 
-                shape=(constants.RESOLUTION_LIDAR_SENSOR - 1,),  # 180 rays (exclude duplicate at ±π)
-                dtype=np.float32
-            ),
-            "semantic": spaces.Box(
-                low=-np.inf, high=np.inf, shape=(constants.RESOLUTION_SEMANTIC_SENSOR, 3), dtype=np.float32 
-            ),
-            "pose": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "velocity": spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
-            "grasper": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-        }
-    )
-
-# def build_observation_space() -> spaces.Dict:
-#     """Build observation space for RL environment."""
-#     return spaces.Dict(
-#         {
-#             "lidar": spaces.Box(
-#                 low=0.0, 
-#                 high=1.0, 
-#                 shape=(constants.RESOLUTION_LIDAR_SENSOR - 1,),  # 180 rays (exclude duplicate at ±π)
-#                 dtype=np.float32
-#             ),
-#             "semantic": spaces.Box(
-#                 low=-np.inf, high=np.inf, shape=(constants.RESOLUTION_SEMANTIC_SENSOR, 3), dtype=np.float32 
-#             ),
-#             "pose": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-#             "velocity": spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
-#             "grasper": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-#         }
-#     )
+# Observation space should be img or 1D vector (flattened- better for RL algorithms)
+obs_range = (constants.RESOLUTION_LIDAR_SENSOR-1) + (constants.RESOLUTION_SEMANTIC_SENSOR*3) + 3 + 2  # lidar + semantic + pose + velocity; grasper handled separately
+OBSERVATION_SPACE = spaces.Box(
+    low=-np.inf,
+    high=np.inf,
+    shape=(obs_range,),
+    dtype=np.float32
+)
 
 class Pose:
     """Pose representation for tracking position and orientation"""
@@ -120,15 +94,15 @@ def process_semantic(semantic_values):
     return result
 
 def build_obs(drone):
-    """Convert raw drone sensors → RLEnv format"""
-    # LIDAR: 360° wall detection, normalized to [0, 1]
+    """Convert raw drone sensors → RLEnv format. Not flattened for model yet."""
+    # LIDAR: 360° wall detection, normalized to [-1, 1]
     lidar = np.array(drone.lidar_values(), dtype=np.float32)
     if lidar is None or len(lidar) == 0:
         lidar = np.zeros(constants.RESOLUTION_LIDAR_SENSOR, dtype=np.float32)
     # Exclude last value (duplicate of first at ±π) -> 180 rays
     lidar = lidar[:-1]
-    # Normalize to [0, 1] range
-    lidar = np.clip(lidar / constants.MAX_RANGE_LIDAR_SENSOR, 0, 1)
+    # Normalize to [-1, 1] range
+    lidar = np.clip(lidar / constants.MAX_RANGE_LIDAR_SENSOR, 0, 1) * 2 - 1
 
     # Pose: position and orientation
     # Handles both GPS zones and No-GPS zones
@@ -164,31 +138,15 @@ def build_obs(drone):
     # Semantic sensor
     semantic = process_semantic(drone.semantic_values())
 
-    # Grasper state
-    grasper = np.array([1.0 if len(drone.grasped_wounded_persons()) > 0 else 0.0], dtype=np.float32)
-
     # Send to drone
     drone.pose = pose
     
     obs = {
-        "lidar": lidar,
         "pose": pose,
         "velocity": vel,
+        "lidar": lidar,
         "semantic": semantic,
-        "grasper": grasper
     }
-
-    # --- MAPPING APPROACH --- # (Ad) Issue with variable size and redundant info
-    # if not hasattr(build_obs, "has_run"):
-    #     build_obs.has_run = True
-    #     drone.pose = find_pose(drone)
-    #     drone.grid = OccupancyGrid(drone.size_area, resolution=1, lidar=drone.lidar(), semantic=drone.semantic())
-    # else:
-    #     drone.pose = find_pose(drone, drone.pose) 
-    #     drone.grid.update_grid(drone.pose)
-    # obs["grid"] = np.array(drone.grid)
-    # obs["pose"] = np.array(drone.pose)
-
     return obs
 
 def to_commands_dict(action: np.ndarray) -> CommandsDict:
@@ -199,7 +157,7 @@ def to_commands_dict(action: np.ndarray) -> CommandsDict:
         "forward": float(action[0]),
         "lateral": float(action[1]),
         "rotation": float(action[2]),
-        "grasper": int(action[3])
+        "grasper": int((action[3])) # Predicted as 0 or 1 by separate logic
     }
     return command
 
@@ -207,17 +165,15 @@ def to_commands_dict(action: np.ndarray) -> CommandsDict:
 def flatten_observation(obs):
     """Flatten Dict observation to vector for SB3"""
     vec = np.concatenate([
-        obs["lidar"].ravel(),
-        obs["semantic"].ravel(),
+        obs["lidar"],
+        obs["semantic"].flatten(),
         obs["pose"],
         obs["velocity"],
-        obs["grasper"]
     ]).astype(np.float32)
     return vec
 
 
 def obs_to_tensor(obs):
-    pass
-    # vec = flatten_observation(obs)
-    # return torch.tensor(vec, dtype=torch.float32).unsqueeze(0)  # (1, D)
+    vec = flatten_observation(obs)
+    return torch.tensor(vec, dtype=torch.float32).unsqueeze(0)  # (1, D)
 

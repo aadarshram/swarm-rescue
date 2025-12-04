@@ -35,6 +35,7 @@
   - TODO:
     - Exploration policy (programmed)
     - RL exploration policy
+    - If found person - move to person for pick up- programmed policy.
     - Pick person and drop at rescue centre programmed policy
     - Return to base when time's almost out programmed policy.
     - High level logic policy

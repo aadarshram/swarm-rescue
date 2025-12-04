@@ -11,12 +11,12 @@ import gymnasium as gym
 import arcade
 
 from swarm_rescue.simulation.utils import constants
-from swarm_rescue.solutions.my_drone_RL import MyDroneRL
+from swarm_rescue.solutions.RL.my_drone_RL import MyDroneRL
 from swarm_rescue.simulation.gui_map.gui_sr import GuiSR
 # Maps
 from swarm_rescue.maps.map_medium_01 import MapMedium01
 from swarm_rescue.maps.map_intermediate_01 import MapIntermediate01
-from swarm_rescue.solutions.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, to_commands_dict
+from swarm_rescue.solutions.RL.rl_utils import ACTION_SPACE, OBSERVATION_SPACE, build_obs, to_commands_dict, flatten_observation
 
 map_dict = {
     "Medium01": MapMedium01,
@@ -39,17 +39,6 @@ class DroneRLEnv(gym.Env):
     Action Space: continuous or multi-discrete
     - Forward, Lateral, Rotation: [-1, 1]
     - Grasper: {0, 1}
-
-    Reward function
-    - Every step: -0.5
-    - If hit the wall: -1
-    - Touch the person: +1
-    - Grasp each person back to rescue center: +50
-    - Rotation penalty: abs(rotation_value) - to avoid the agent constantly rotating to prevent the wall
-    - Exploration increase score
-
-    Terminate when bring all the humans back to the rescue center.
-
     """
 
     metadata = {"render.modes": ["human", "rgb_array"], "render_fps": 30}
@@ -87,7 +76,7 @@ class DroneRLEnv(gym.Env):
         self._agent = None
         self.action_space = ACTION_SPACE
         self.observation_space = OBSERVATION_SPACE
-                        
+        
         # Bookkeeping
         self.ep_count = 0
         self.current_step = 0
@@ -96,11 +85,14 @@ class DroneRLEnv(gym.Env):
         self.last_exp_score = None
         self.prev_obs = None
         self.prev_health = None
+        
+        # Episode statistics for evaluation
 
         self.re_init()
 
     def construct_action(self, action):
         """Convert action array to CommandsDict format expected by the simulator"""
+        # Action is a 1D vector of le  ngth 4
         # Clip values to valid range [-1, 1] for continuous, [0, 1] for grasper
         action = np.clip(action, [-1, -1, -1, 0], [1, 1, 1, 1])
         return to_commands_dict(action)
@@ -110,7 +102,9 @@ class DroneRLEnv(gym.Env):
       
     def _get_obs(self):
         obs = build_obs(self._agent)
-        return obs
+        # RL Env returns flattened observation
+        obs_flat = flatten_observation(obs)
+        return obs_flat
 
     def _get_info(self):
         info = {}
@@ -126,9 +120,9 @@ class DroneRLEnv(gym.Env):
         
         # Get drone position
         if self._agent is not None:
-            info["drones_true_pos"] = self._agent.true_gps_position()
+            info["drones_true_pos"] = self._agent.true_position()
         # Get drone orientation
-            info["drones_true_angle"] = self._agent.true_compass_angle()
+            info["drones_true_angle"] = self._agent.true_angle()
             info["drone_true_velocity"] = self._agent.true_velocity()
             info["drone_true_angular_velocity"] = self._agent.true_angular_velocity()
             # TODO: Add more true values here as info to debug against policy
@@ -185,7 +179,7 @@ class DroneRLEnv(gym.Env):
 
     # Gym API
 
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+    def reset(self, seed = None, options = None):
 
         super().reset(seed=seed)
 
@@ -196,6 +190,16 @@ class DroneRLEnv(gym.Env):
         self.ep_count += 1
         self.prev_obs = None
         self.prev_health = None
+        
+        # Reset episode statistics
+        self.episode_stats = {
+            'steps_taken': 0,
+            'total_reward': 0.0,
+            'rescued': 0,
+            'success': False,
+            'health_lost': 0.0,
+            'exploration_progress': 0.0,
+        }
 
         # Step the playground once to initialize sensors (they return NaN initially)
         if self._playground is not None and self._agent is not None:
@@ -236,50 +240,38 @@ class DroneRLEnv(gym.Env):
         # Run several simulator ticks per action (like GuiSR.on_update loop)
         while counter < self.fixed_step and not done: # TODO: Is this fixed step business correct. if so what value is correct?
             # Construct command dict for the agent
-            cmd = {self._agent: self.construct_action(action)}
+            grasper = 1.0 if self._agent.found_wounded()[0] else 0.0
+            cmd = {self._agent: self.construct_action(np.append(action, grasper))}
             
             # Step the playground (core simulation step)
             if self._playground is not None:
-                self._playground.step(all_commands=cmd, all_messages={})
-            # GUI update for rendering
-            if self.render_mode == "human":
-                try:
-                    if self.gui is not None:
-                        # Check if window was closed externally
-                        if hasattr(self.gui._playground.window, 'has_exit') and self.gui._playground.window.has_exit:
-                            terminated = True
-                            truncated = True
-                            break
+                self._playground.step(all_commands=cmd, all_messages=self._agent.msg_data)
+            # # GUI update for rendering
+            # if self.render_mode == "human":
+            #     try:
+            #         if self.gui is not None:
+            #             # Check if window was closed externally
+            #             if hasattr(self.gui._playground.window, 'has_exit') and self.gui._playground.window.has_exit:
+            #                 terminated = True
+            #                 truncated = True
+            #                 break
                             
-                        self.gui.draw()
-                        self.gui._playground.window.flip()
-                        self.gui._playground.window.dispatch_events()
+            #             self.gui.draw()
+            #             self.gui._playground.window.flip()
+            #             self.gui._playground.window.dispatch_events()
                         
-                        # Check again after dispatching events
-                        if hasattr(self.gui._playground.window, 'has_exit') and self.gui._playground.window.has_exit:
-                            terminated = True
-                            truncated = True
-                            break
-                except Exception:
-                    # If window is closed, accessing it might raise exception
-                    terminated = True
-                    truncated = True
-                    break
+            #             # Check again after dispatching events
+            #             if hasattr(self.gui._playground.window, 'has_exit') and self.gui._playground.window.has_exit:
+            #                 terminated = True
+            #                 truncated = True
+            #                 break
+            #     except Exception:
+            #         # If window is closed, accessing it might raise exception
+            #         terminated = True
+            #         truncated = True
+            #         break
 
-            # Check if all wounded persons rescued (termination condition)
-            # Or terminates if times up
-            total_wounded = getattr(self._map, "_number_wounded_persons", 0)
-            if self.total_rescued >= total_wounded and total_wounded > 0:
-                terminated = True
-                break
-            if self._agent.elapsed_timestep >= self._agent._misc_data.max_timestep_limit:
-                terminated = True
-                truncated = True
-                break
-            if self._agent.elapsed_walltime >= self._agent._misc_data.max_walltime_limit:
-                terminated = True
-                truncated = True
-                break
+
 
             # Capture frames for video if needed
             if counter % frame_skip == 0 and self.render_mode == "rgb_array":
@@ -292,15 +284,29 @@ class DroneRLEnv(gym.Env):
 
         # Calculate reward
         reward = self._calculate_reward(prev_grasped, prev_health, action)
+        # Terminates if times up
+        ep = 2 # Margin
+        if self._agent.elapsed_timestep >= self._agent._misc_data.max_timestep_limit - ep:
+            terminated = True
+            truncated = True
+            # High penalty for timeout
+            reward -= 10.0
+        if self._agent.elapsed_walltime >= self._agent._misc_data.max_walltime_limit - ep:
+            terminated = True
+            truncated = True
+            # High penalty for timeout
+            reward -= 10.0
 
-        # total_wounded = getattr(self._map, "_number_wounded_persons", 0) # Info for debug        
+        # Mission completion
+        total_wounded = getattr(self._map, "_number_wounded_persons", 0)
+        if self.total_rescued >= total_wounded and total_wounded > 0:
+            self.episode_stats['success'] = True
 
         self.current_step += 1
+        self.episode_stats['steps_taken'] = self.current_step
+        self.episode_stats['total_reward'] += reward
 
-        # Check for episode truncation
-        if self.current_step >= self.max_steps: # TODO: Is this correct?
-            truncated = True
-            reward -= 20.0
+        # When to truncate episode
 
         # Get observation and info
         obs = self._get_obs()
@@ -310,17 +316,72 @@ class DroneRLEnv(gym.Env):
         info["total_rescued"] = self.total_rescued
         info["current_step"] = self.current_step
         
+        # Add episode statistics to info for logging/evaluation
+        info["episode_stats"] = dict(self.episode_stats)
+        
         if info["done"]:
             info["ep_frames"] = list(self.frames)
+            # Final episode statistics
+            info["episode"] = {
+                'r': self.episode_stats['total_reward'],
+                'l': self.episode_stats['steps_taken'],
+                'rescued': self.episode_stats['rescued'],
+                'success': self.episode_stats['success'],
+                'health_lost': self.episode_stats['health_lost'],
+                'exploration': self.episode_stats['exploration_progress'],
+            }
 
         return obs, float(reward), bool(terminated), bool(truncated), info
 
     def _calculate_reward(self, prev_grasped, prev_health, action):
         """Calculate comprehensive reward based on multiple factors"""
 
+        # For agent exploration
         reward = 0.0
-        # Timestep penalty 
-        reward += -0.01
+        
+        # Timestep penalty (encourage efficiency)
+        reward += -1
+        
+        # Rotation penalty (to avoid excessive spinning)
+        reward += -0.08 * abs(action[2])  # Penalize based on rotation magnitude
+
+        # Health penalty (collision damage)
+        if self._agent and hasattr(self._agent, 'drone_health'):
+            current_health = self._agent.drone_health
+            health_loss = max(0.0, prev_health - current_health)
+            # Normalize 
+            health_loss /= constants.DRONE_INITIAL_HEALTH
+            if health_loss > 0:
+                reward -= 1 * health_loss
+                self.episode_stats['health_lost'] += health_loss
+        
+        # LIDAR-based collision avoidance
+        if self._agent:
+            lidar_values = self._agent.lidar_values()
+            if lidar_values is not None and len(lidar_values) > 0:
+                min_distance = np.min(lidar_values)
+                
+                if min_distance < 40:
+                    # Penalty increases as drone gets closer to obstacles
+                    reward += -10.0 * (40 - min_distance - 5) / 40.0 # 5 is a small buffer
+        
+        # Exploration reward
+        # Can use internal state map explored since only exposed to agent as reward and not state
+        if hasattr(self._map, 'explored_map'):
+            current_exp_score = self._map.explored_map.score()
+            exp_progress = current_exp_score - self.last_exp_score if self.last_exp_score is not None else 0.0
+            reward += 10.0 * exp_progress  # Scale exploration reward
+            self.last_exp_score = current_exp_score
+            self.episode_stats['exploration_progress'] += exp_progress
+        
+        # Reward to go close to wounded people
+        if self._agent.found_wounded()[0]:
+            reward += 5.0  # Reward for touching a wounded person; default rescue logic handles grasping and rescue
+        
+        # If drone destroyed, large penalty
+        if self._agent and self._agent.removed:
+            reward -= 50.0
+        
         return reward
 
     def close(self):

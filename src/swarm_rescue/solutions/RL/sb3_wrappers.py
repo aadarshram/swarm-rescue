@@ -8,7 +8,7 @@ algorithms, particularly handling the Dict observation space.
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from swarm_rescue.solutions.rl_utils import flatten_observation
+from swarm_rescue.solutions.RL.rl_utils import flatten_observation
 
 
 class FlattenObservationWrapper(gym.ObservationWrapper):
@@ -160,16 +160,15 @@ def make_sb3_env(
     Returns:
         Wrapped environment ready for SB3 training
     """
-    from swarm_rescue.solutions.my_drone_rl_framework import DroneRLEnv
-    from swarm_rescue.solutions.my_drone_RL import MyDroneRL
+    from swarm_rescue.solutions.RL.my_drone_rl_framework import DroneRLEnv
+    from swarm_rescue.solutions.RL.my_drone_RL import MyDroneRL
     
     # Create base environment
     env = DroneRLEnv(
         map_name=map_name,
-        render_mode=None,
+        render_mode="human" if not headless else None,
         max_steps=max_steps,
         fixed_step=fixed_step,
-        use_exp_map=False,
         headless=headless,
         drone_cls=MyDroneRL,
     )
