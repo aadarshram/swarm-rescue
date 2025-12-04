@@ -39,4 +39,9 @@
     - Pick person and drop at rescue centre programmed policy
     - Return to base when time's almost out programmed policy.
     - High level logic policy
+   
+    - multiagent
+    - Write logic to combine maps of multiple drones
+    - communicate the locations where persons are
+    - drones should pathplan and go to that location to rescue persons.
 
