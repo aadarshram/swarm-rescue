@@ -45,3 +45,36 @@
     - communicate the locations where persons are
     - drones should pathplan and go to that location to rescue persons.
 
+
+-------------------------------------------------
+meet on 23.1.26
+
+- proper frontier exploration algorithm
+  - resolution. obstacles and new frontiers
+  - End of lidar also marked as obstacle. Fix.
+  - Frequency map is stupid. Fix.
+- Once person picked,
+  - Goal directed obstacle avoidance path.
+  - Anup BUG 1 BUG 2
+- Multi agent fighting. Fix.
+  - Picking same person both.
+- Going back to rescue center, proper find path. Dont get stuck.
+
+Work:
+
+- Anup: Goal oriented obstacle avoidance AND Going back to rescue center, proper find path. Dont get stuck.
+- Arnav and Advay: Multi agent cooperation AND all things multiagent - do research.
+- Aadarsh and Kairav: Frontier fix- Kairav focus on good code from online. Aadarsh on existing code to fix. Noise filter.
+
+
+Mission swarm
+- Get 1st in india.
+- Finals is on March 19th.
+- Jan 23 - catchup
+- Jan 30 - single agent full complete- easy medium
+- Feb 6 - multi agent easy , single agent hard
+- Feb 13 - multi agent medium , single agent hard - all specials
+- Feb 20 - multi agent hard  - specials
+- Feb 27 - refine 
+- March 6 - refine
+- March 13 - refine

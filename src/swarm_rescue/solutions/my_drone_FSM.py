@@ -66,13 +66,11 @@ class MyDroneFSM(DroneAbstract):
         self.distStopStraight = random.uniform(10, 50)
         self.isTurning = False
         
-        # Occupancy grid for frontier-based exploration
-        # Grid cell states: 0=UNKNOWN, 1=FREE, 2=OCCUPIED, 3=WOUNDED, 4=RESCUE
+        # Occupancy grid for frontier-based exploration (LIDAR-only)
+        # Grid cell states: 0=UNKNOWN, 1=FREE, 2=OCCUPIED
         self.UNKNOWN = 0
         self.FREE = 1
         self.OCCUPIED = 2
-        self.WOUNDED = 3
-        self.RESCUE = 4
         
         # Initialize grid from map size
         if misc_data and hasattr(misc_data, 'size_area') and misc_data.size_area is not None:
@@ -95,6 +93,13 @@ class MyDroneFSM(DroneAbstract):
         
         # Initialize grid as all UNKNOWN
         self.occupancy_grid = np.zeros((self.grid_height, self.grid_width), dtype=np.uint8)
+        
+        # Probabilistic occupancy: count hits per cell for temporal filtering
+        self.occupied_hits = np.zeros((self.grid_height, self.grid_width), dtype=np.uint8)
+        self.free_hits = np.zeros((self.grid_height, self.grid_width), dtype=np.uint8)
+        
+        # Obstacle inflation for safe navigation (in cells)
+        self.obstacle_inflation_radius = 2  # Inflate obstacles by 2 cells (~8px) for safety
         
         # Frontier exploration state
         self.current_frontier_goal = None  # (x, y) in world coordinates
@@ -262,12 +267,15 @@ class MyDroneFSM(DroneAbstract):
         return cells
     
     def update_occupancy_grid(self):
-        """Update occupancy grid from LIDAR and semantic sensors."""
+        """
+        Update occupancy grid from LIDAR sensor only.
+        Uses temporal filtering to reduce noise and obstacle inflation for safe navigation.
+        """
         current_pos = self.measured_gps_position()
         current_angle = self.measured_compass_angle()
         
         if current_pos is None or current_angle is None:
-            return
+            return # TODO: Implement alternative via odometry if GPS/compass unavailable
         
         drone_cell_x, drone_cell_y = self.world_to_cell(current_pos[0], current_pos[1])
         
@@ -275,97 +283,83 @@ class MyDroneFSM(DroneAbstract):
         if self.is_valid_cell(drone_cell_x, drone_cell_y):
             self.visited_cells[drone_cell_y, drone_cell_x] += 1
         
-        # Update from LIDAR
+        # Update from LIDAR only
         lidar_sensor = self.lidar()
-        if lidar_sensor is not None:
-            values = lidar_sensor.get_sensor_values()  # type: ignore
-            angles = lidar_sensor.ray_angles  # type: ignore
-            max_range = 300  # LIDAR max range
-            
-            if values is not None and angles is not None:
-                for angle, measured_range in zip(angles, values):
-                    if measured_range is None or measured_range <= 0:
-                        continue
-                    
-                    # Ray angle in world frame
-                    ray_angle = current_angle + angle
-                    
-                    # Calculate endpoint in world coordinates using LIDAR measured distance
-                    # LIDAR returns exact distance to obstacle (or max_range if nothing hit)
-                    end_x = current_pos[0] + measured_range * math.cos(ray_angle)
-                    end_y = current_pos[1] + measured_range * math.sin(ray_angle)
-                    
-                    end_cell_x, end_cell_y = self.world_to_cell(end_x, end_y)
-                    
-                    # Ray-cast from drone to endpoint using Bresenham's algorithm
-                    cells_on_ray = self.bresenham_line(drone_cell_x, drone_cell_y, end_cell_x, end_cell_y)
-                    
-                    # CRITICAL: Check if ray actually hit an obstacle (not just reached max range)
-                    if measured_range < max_range - 5:  # Hit an obstacle (wall)
-                        # Mark cells along ray as FREE (except last cell)
-                        for i, (cx, cy) in enumerate(cells_on_ray[:-1]):
-                            if self.is_valid_cell(cx, cy):
-                                # Mark as FREE unless it's a known WOUNDED or already OCCUPIED
-                                if self.occupancy_grid[cy, cx] in [self.UNKNOWN, self.RESCUE]:
-                                    self.occupancy_grid[cy, cx] = self.FREE
-                        
-                        # Mark endpoint as OCCUPIED (we hit something - a wall)
-                        if len(cells_on_ray) > 0:
-                            ex, ey = cells_on_ray[-1]
-                            if self.is_valid_cell(ex, ey):
-                                # Don't overwrite WOUNDED, but can overwrite RESCUE (might be wall behind it)
-                                if self.occupancy_grid[ey, ex] != self.WOUNDED:
-                                    self.occupancy_grid[ey, ex] = self.OCCUPIED
-                    else:
-                        # Ray reached max range - mark all cells as FREE (open space)
-                        for (cx, cy) in cells_on_ray:
-                            if self.is_valid_cell(cx, cy):
-                                # Mark as FREE unless it's WOUNDED or OCCUPIED
-                                if self.occupancy_grid[cy, cx] in [self.UNKNOWN, self.RESCUE]:
-                                    self.occupancy_grid[cy, cx] = self.FREE
+        if lidar_sensor is None:
+            return
         
-        # Update from semantic sensor
-        semantic_values = self.semantic_values()
-        if semantic_values is not None:
-            for data in semantic_values:
-                if data.distance <= 0:
-                    continue
-                
-                # Calculate world position of detected entity
-                entity_angle = current_angle + data.angle
-                entity_x = current_pos[0] + data.distance * math.cos(entity_angle)
-                entity_y = current_pos[1] + data.distance * math.sin(entity_angle)
-                
-                entity_cell_x, entity_cell_y = self.world_to_cell(entity_x, entity_y)
-                
-                if not self.is_valid_cell(entity_cell_x, entity_cell_y):
-                    continue
-                
-                # Check if path to entity is blocked by walls
-                path_cells = self.bresenham_line(drone_cell_x, drone_cell_y, entity_cell_x, entity_cell_y)
-                path_blocked = False
-                for (cx, cy) in path_cells[:-1]:  # Check all cells except the entity itself
+        values = lidar_sensor.get_sensor_values()  # type: ignore
+        angles = lidar_sensor.ray_angles  # type: ignore
+        max_range = 300  # LIDAR max range
+        
+        if values is None or angles is None:
+            return
+        
+        # Process every Nth ray for performance (181 rays is overkill)
+        ray_skip = 3  # Process every 3rd ray (~60 rays instead of 181)
+        
+        for i in range(0, len(values), ray_skip):
+            measured_range = values[i]
+            angle = angles[i]
+            
+            if measured_range is None or measured_range <= 0:
+                continue
+            
+            # Ray angle in world frame
+            ray_angle = current_angle + angle
+            
+            # Calculate endpoint in world coordinates
+            end_x = current_pos[0] + measured_range * math.cos(ray_angle)
+            end_y = current_pos[1] + measured_range * math.sin(ray_angle)
+            
+            end_cell_x, end_cell_y = self.world_to_cell(end_x, end_y)
+            
+            # Ray-cast from drone to endpoint using Bresenham's algorithm
+            cells_on_ray = self.bresenham_line(drone_cell_x, drone_cell_y, end_cell_x, end_cell_y)
+            
+            # Check if ray hit an obstacle (not just reached max range)
+            hit_obstacle = measured_range < 0.999 * max_range
+            
+            if hit_obstacle:
+                # Mark cells along ray as FREE (except last cell)
+                for (cx, cy) in cells_on_ray[:-1]:
                     if self.is_valid_cell(cx, cy):
-                        if self.occupancy_grid[cy, cx] == self.OCCUPIED:
-                            path_blocked = True
-                            break
+                        self.free_hits[cy, cx] = min(255, self.free_hits[cy, cx] + 1)
+                        # Update cell state with temporal filter
+                        if self.free_hits[cy, cx] >= 2 and self.occupancy_grid[cy, cx] == self.UNKNOWN:
+                            self.occupancy_grid[cy, cx] = self.FREE
                 
-                # Only mark entity if path is clear (semantic sensor can't see through walls)
-                if not path_blocked:
-                    # Mark path cells as FREE (we can see them)
-                    for (cx, cy) in path_cells[:-1]:
-                        if self.is_valid_cell(cx, cy):
-                            if self.occupancy_grid[cy, cx] == self.UNKNOWN:
-                                self.occupancy_grid[cy, cx] = self.FREE
-                    
-                    # Mark cells based on entity type
-                    if data.entity_type == DroneSemanticSensor.TypeEntity.WOUNDED_PERSON:
-                        if not data.grasped:
-                            self.occupancy_grid[entity_cell_y, entity_cell_x] = self.WOUNDED
-                    elif data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
-                        # Only mark as RESCUE if not already marked as OCCUPIED
-                        if self.occupancy_grid[entity_cell_y, entity_cell_x] != self.OCCUPIED:
-                            self.occupancy_grid[entity_cell_y, entity_cell_x] = self.RESCUE
+                # Mark endpoint as OCCUPIED with temporal filter (reduce noise)
+                if len(cells_on_ray) > 0:
+                    ex, ey = cells_on_ray[-1]
+                    if self.is_valid_cell(ex, ey):
+                        self.occupied_hits[ey, ex] = min(255, self.occupied_hits[ey, ex] + 1)
+                        # Require 3+ hits to mark as OCCUPIED (noise filtering)
+                        if self.occupied_hits[ey, ex] >= 3:
+                            self.occupancy_grid[ey, ex] = self.OCCUPIED
+                            # Inflate obstacle for safety
+                            self._inflate_obstacle(ex, ey)
+            else:
+                # Ray reached max range - mark all cells as FREE (open space)
+                for (cx, cy) in cells_on_ray:
+                    if self.is_valid_cell(cx, cy):
+                        self.free_hits[cy, cx] = min(255, self.free_hits[cy, cx] + 1)
+                        if self.free_hits[cy, cx] >= 2 and self.occupancy_grid[cy, cx] == self.UNKNOWN:
+                            self.occupancy_grid[cy, cx] = self.FREE
+    
+    def _inflate_obstacle(self, cell_x: int, cell_y: int):
+        """Inflate obstacle by marking nearby cells as occupied for safe navigation."""
+        for dy in range(-self.obstacle_inflation_radius, self.obstacle_inflation_radius + 1):
+            for dx in range(-self.obstacle_inflation_radius, self.obstacle_inflation_radius + 1):
+                # Check if within circular radius
+                if dx*dx + dy*dy > self.obstacle_inflation_radius * self.obstacle_inflation_radius:
+                    continue
+                
+                nx, ny = cell_x + dx, cell_y + dy
+                if self.is_valid_cell(nx, ny):
+                    # Only inflate UNKNOWN or already OCCUPIED cells (don't overwrite FREE)
+                    if self.occupancy_grid[ny, nx] in [self.UNKNOWN, self.OCCUPIED]:
+                        self.occupancy_grid[ny, nx] = self.OCCUPIED
     
     def detect_frontiers(self) -> List[Tuple[Tuple[float, float], int, int]]:
         """
@@ -571,9 +565,10 @@ class MyDroneFSM(DroneAbstract):
                     for dx_check in [-1, 0, 1]:
                         check_x, check_y = cell_x + dx_check, cell_y + dy_check
                         if self.is_valid_cell(check_x, check_y):
-                            if self.occupancy_grid[check_y, check_x] == self.OCCUPIED:
+                            cell_state = self.occupancy_grid[check_y, check_x]
+                            if cell_state == self.OCCUPIED:
                                 occupied_count += 1
-                            elif self.occupancy_grid[check_y, check_x] == self.UNKNOWN:
+                            elif cell_state == self.UNKNOWN:
                                 unknown_count += 1
         
         # Path is blocked if we detected many walls OR too much unknown (potential walls)
@@ -691,8 +686,7 @@ class MyDroneFSM(DroneAbstract):
                             for dx in range(-3, 4):
                                 gx, gy = goal_cell_x + dx, goal_cell_y + dy
                                 if self.is_valid_cell(gx, gy):
-                                    if self.occupancy_grid[gy, gx] != self.WOUNDED:
-                                        self.occupancy_grid[gy, gx] = self.OCCUPIED
+                                    self.occupancy_grid[gy, gx] = self.OCCUPIED
                                     # Also mark as heavily visited
                                     self.visited_cells[gy, gx] += 10
                     
@@ -1049,7 +1043,9 @@ class MyDroneFSM(DroneAbstract):
         """
         command: CommandsDict = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
-        # Save initial position on first call
+        # ON FIRST CALL
+
+        # Save initial position and return base for later use
         if self.start_position is None:
             start_pos = self.measured_gps_position()
             if start_pos is not None:
@@ -1058,6 +1054,10 @@ class MyDroneFSM(DroneAbstract):
                 # Return base is same as start position
                 self.return_base = self.start_position
                 # print(f"Drone {self.identifier}: Return base set at {self.return_base}")
+        
+        # TODO: Else use odometer if no GPS available to find start position
+
+        # ----
 
         # Update occupancy grid from sensors
         self.update_occupancy_grid()
