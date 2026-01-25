@@ -10,6 +10,7 @@ import numpy as np
 from collections import deque
 import pickle
 from pathlib import Path
+from scipy import interpolate
 
 from swarm_rescue.simulation.drone.controller import CommandsDict
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
@@ -46,7 +47,7 @@ class MyDroneFSM(DroneAbstract):
                          misc_data=misc_data,
                          display_lidar_graph=False,
                          **kwargs)
-        
+    
         # Initialize FSM state
         self.state = self.State.SEARCHING_WOUNDED
 
@@ -66,6 +67,9 @@ class MyDroneFSM(DroneAbstract):
         self.distStopStraight = random.uniform(10, 50)
         self.isTurning = False
         
+        # Step counter for timer-based logic
+        self.step_count = 0
+        
         # Occupancy grid for frontier-based exploration (LIDAR-only)
         # Grid cell states: 0=UNKNOWN, 1=FREE, 2=OCCUPIED
         self.UNKNOWN = 0
@@ -79,7 +83,7 @@ class MyDroneFSM(DroneAbstract):
             # Fallback to reasonable defaults if not available
             map_width, map_height = 1000, 1000
         
-        self.grid_resolution = 4  # pixels per cell 
+        self.grid_resolution = 15
         self.grid_width = int(np.ceil(map_width / self.grid_resolution))
         self.grid_height = int(np.ceil(map_height / self.grid_resolution))
         
@@ -89,17 +93,40 @@ class MyDroneFSM(DroneAbstract):
     
         # Initialize grid as all UNKNOWN
         self.occupancy_grid = np.zeros((self.grid_height, self.grid_width), dtype=np.uint8)
+        self.inflation_radius = 2  # Inflate obstacles by 2 cells (30px safety margin)
+        self.inflated_grid = None  # Inflated version for safe path planning
+        
+        # Global occupancy grid (aggregated from all drones) - only maintained by drone 0 for visualization
+        self.global_occupancy_grid = np.zeros((self.grid_height, self.grid_width), dtype=np.uint8) if identifier == 0 else None
         
         # Frontier exploration state
         self.current_frontier_goal = None  # (x, y) in world coordinates
+        self.current_path = None  # List of (x, y) world coordinates along planned path
+        self.path_waypoint_index = 0  # Current waypoint along path
+        self.goal_start_time = 0  # Step count when current goal was set
+        self.goal_timeout_threshold = 300  # Reset goal after 300 steps (~10 sec at 30Hz)
+        
+        # PID controller state
+        self.last_angle_error = 0.0  # For derivative term
+        self.angle_error_integral = 0.0  # For integral term
    
         self.visited_cells = np.zeros((self.grid_height, self.grid_width), dtype=np.uint16)  # Visit frequency
+        
+        # Grid sharing for multi-drone coordination
+        self.grid_changed_cells = set()  # Track cells updated since last communication
+        self.last_shared_timestamp = 0
         
         # Sensor range constants
         self.lidar_max_range = 300  # LIDAR max detection range
         self.semantic_max_range = 300  # Semantic sensor max range
         self.sensor_effective_range = 240  # Conservative effective range for frontier filtering
         
+
+        # DEBUG flags
+        self.gps()._noise = False
+        self.compass()._noise = False
+        self.odometer()._noise = False
+        self.lidar()._noise = False  # type: ignore
         # Visualization export (only drone 0 exports to avoid file conflicts)
         self.enable_viz_export = False # (identifier == 0)  # Only first drone exports
         self.viz_export_counter = 0
@@ -109,16 +136,26 @@ class MyDroneFSM(DroneAbstract):
     def define_message_for_all(self) -> Tuple[Optional[int], Tuple]:  # type: ignore
         """
         Communication between drones controlled by same FSM.
-        Message format: (drone_id, (state, rescue_center_pos, target_wounded_pos, current_pos))
+        Message format: (drone_id, (state, rescue_center_pos, target_wounded_pos, current_pos, grid_updates))
         """
         current_pos = self.measured_gps_position()
+        
+        # Package grid updates (only send changed cells to reduce data)
+        grid_updates = None
+        if len(self.grid_changed_cells) > 0:
+            # Send list of (x, y, value) tuples for changed cells
+            grid_updates = [(x, y, int(self.occupancy_grid[y, x])) 
+                           for x, y in list(self.grid_changed_cells)[:100]]  # Limit to 100 cells per message
+            self.grid_changed_cells.clear()
+        
         msg_data = (
             self.identifier,
             (
                 self.state.value,  # Current FSM state
                 self.rescue_center_position if self.found_rescue_center else None,
                 self.target_wounded_position,  # Which wounded person I'm targeting
-                current_pos  # Current position
+                current_pos,  # Current position
+                grid_updates  # Occupancy grid updates
             )
         )
         return msg_data
@@ -129,6 +166,7 @@ class MyDroneFSM(DroneAbstract):
         1. Learn rescue center location from others
         2. Know which wounded persons are claimed by other drones
         3. Track other drones' positions to avoid clustering
+        4. Merge occupancy grid updates from other drones
         """
         if not self.communicator:
             return
@@ -141,7 +179,7 @@ class MyDroneFSM(DroneAbstract):
         for msg in received_messages:
             message = msg[1]
             other_drone_id = message[0]
-            other_state, other_rescue_pos, other_target_wounded, other_position = message[1]
+            other_state, other_rescue_pos, other_target_wounded, other_position, grid_updates = message[1]
             
             # Learn rescue center location from other drones
             if other_rescue_pos is not None and not self.found_rescue_center:
@@ -152,6 +190,25 @@ class MyDroneFSM(DroneAbstract):
             # Track which wounded persons are claimed by other drones
             if other_target_wounded is not None:
                 self.claimed_wounded_positions[other_drone_id] = other_target_wounded
+            
+            # Merge occupancy grid updates from other drone
+            if grid_updates is not None:
+                for x, y, value in grid_updates:
+                    if self.is_valid_cell(x, y):
+                        # Merge into local grid
+                        # Merge strategy: OCCUPIED takes priority (union of all obstacles)
+                        if value == self.OCCUPIED:
+                            self.occupancy_grid[y, x] = self.OCCUPIED
+                        elif value == self.FREE and self.occupancy_grid[y, x] == self.UNKNOWN:
+                            # Only update UNKNOWN to FREE, don't overwrite OCCUPIED
+                            self.occupancy_grid[y, x] = self.FREE
+                        
+                        # Also merge into global grid (only for drone 0)
+                        if self.global_occupancy_grid is not None:
+                            if value == self.OCCUPIED:
+                                self.global_occupancy_grid[y, x] = self.OCCUPIED
+                            elif value == self.FREE and self.global_occupancy_grid[y, x] == self.UNKNOWN:
+                                self.global_occupancy_grid[y, x] = self.FREE
 
     
     def is_wounded_claimed(self, wounded_position, tolerance=50.0):
@@ -266,24 +323,23 @@ class MyDroneFSM(DroneAbstract):
         if self.is_valid_cell(drone_cell_x, drone_cell_y):
             self.visited_cells[drone_cell_y, drone_cell_x] += 1
         
-        # Update from LIDAR only
-
+        # STEP 1: Update from LIDAR - mark all obstacles as OCCUPIED (standard ray-casting)
         lidar_sensor = self.lidar()
         if lidar_sensor is None:
             return # fallback
         
         values = lidar_sensor.get_sensor_values()  # type: ignore
         angles = lidar_sensor.ray_angles  # type: ignore
-        max_range = 300  # LIDAR max range; TODO: later dont hardcode
+        max_range = self.lidar_max_range
         
         if values is None or angles is None:
             return # fallback
         
         # Process every Nth ray
-        ray_skip = 3
+        ray_skip = 1
         for i in range(0, len(values), ray_skip):
             measured_range = values[i]
-            angle = angles[i]  
+            angle = angles[i]  # Relative angle from drone's perspective
             # Ray angle in world frame
             ray_angle = current_angle + angle
             # Calculate endpoint this is either an obstacle or max range
@@ -296,26 +352,85 @@ class MyDroneFSM(DroneAbstract):
             cells_on_ray = self.bresenham_line(drone_cell_x, drone_cell_y, end_cell_x, end_cell_y)
             
             # Check if ray hit an obstacle
-            hit_obstacle = measured_range < 0.9 * max_range
+            hit_obstacle = measured_range < 0.999 * max_range
             
             if hit_obstacle:
                 # Mark cells along ray as FREE (except last cell)
                 for (cx, cy) in cells_on_ray[:-1]:
                     if self.is_valid_cell(cx, cy):
-                        if not self.occupancy_grid[cy, cx] == self.FREE:
+                        if self.occupancy_grid[cy, cx] != self.OCCUPIED:  # Persist occupied cells
+                            old_value = self.occupancy_grid[cy, cx]
                             self.occupancy_grid[cy, cx] = self.FREE
+                            if old_value != self.FREE:
+                                self.grid_changed_cells.add((cx, cy))
                 
-                # Mark endpoint as OCCUPIED
+                # Mark endpoint as OCCUPIED (all obstacles - walls, drones, wounded, etc.)
                 if len(cells_on_ray) > 0:
                     ex, ey = cells_on_ray[-1]
                     if self.is_valid_cell(ex, ey):
+                        old_value = self.occupancy_grid[ey, ex]
                         self.occupancy_grid[ey, ex] = self.OCCUPIED
+                        if old_value != self.OCCUPIED:
+                            self.grid_changed_cells.add((ex, ey))
             else:
                 # Ray reached max range - mark all cells as FREE (open space)
                 for (cx, cy) in cells_on_ray:
                     if self.is_valid_cell(cx, cy):
-                        if not self.occupancy_grid[cy, cx] == self.FREE:
+                        if self.occupancy_grid[cy, cx] != self.OCCUPIED:  # Persist occupied cells
+                            old_value = self.occupancy_grid[cy, cx]
                             self.occupancy_grid[cy, cx] = self.FREE
+                            if old_value != self.FREE:
+                                self.grid_changed_cells.add((cx, cy))
+        
+        # STEP 2: Override with semantic sensor - clear non-wall obstacles
+        semantic_data = self.semantic_values()
+        if semantic_data is not None:
+            for data in semantic_data:
+                # Semantic detects: WOUNDED_PERSON, DRONE, RESCUE_CENTER (NOT walls)
+                # Calculate position of detected entity in world coordinates
+                detection_angle = current_angle + data.angle  # World frame angle
+                detection_x = current_pos[0] + data.distance * math.cos(detection_angle)
+                detection_y = current_pos[1] + data.distance * math.sin(detection_angle)
+                
+                # Convert to grid cell
+                cell_x, cell_y = self.world_to_cell(detection_x, detection_y)
+                
+                # Clear OCCUPIED marking for non-wall entities (with buffer to handle uncertainty)
+                for dy in range(-1, 2):  # 3x3 cell area around detection
+                    for dx in range(-1, 2):
+                        cx, cy = cell_x + dx, cell_y + dy
+                        if self.is_valid_cell(cx, cy):
+                            # Override: mark as FREE since semantic identified it as non-wall
+                            old_value = self.occupancy_grid[cy, cx]
+                            self.occupancy_grid[cy, cx] = self.FREE
+                            if old_value != self.FREE:
+                                self.grid_changed_cells.add((cx, cy))
+        
+        # TODO: Improve for probabilistic updates later when noise is enabled
+    
+    def inflate_obstacles(self) -> np.ndarray:
+        """Create inflated version of occupancy grid with safety buffer around obstacles.
+        
+        Returns:
+            Inflated grid where obstacles are expanded by inflation_radius cells
+        """
+        inflated = self.occupancy_grid.copy()
+        
+        # Find all occupied cells
+        occupied_cells = np.argwhere(self.occupancy_grid == self.OCCUPIED)
+        
+        # Inflate each occupied cell
+        for y, x in occupied_cells:
+            # Inflate in square around obstacle
+            for dy in range(-self.inflation_radius, self.inflation_radius + 1):
+                for dx in range(-self.inflation_radius, self.inflation_radius + 1):
+                    ny, nx = y + dy, x + dx
+                    if self.is_valid_cell(nx, ny):
+                        # Only inflate into FREE or UNKNOWN cells, not other obstacles
+                        if inflated[ny, nx] != self.OCCUPIED:
+                            inflated[ny, nx] = self.OCCUPIED
+        
+        return inflated
     
     def detect_frontiers(self) -> List[Tuple[Tuple[float, float], int, int]]:
         """
@@ -327,8 +442,12 @@ class MyDroneFSM(DroneAbstract):
         if current_pos is None:
             return []
         
+        # Use inflated grid to avoid frontiers near obstacles
+        inflated_grid = self.inflate_obstacles()
+        
         # Find frontier cells: FREE cells with at least one UNKNOWN neighbor
-        free_mask = (self.occupancy_grid == self.FREE)
+        # Use inflated grid to exclude cells too close to obstacles
+        free_mask = (self.occupancy_grid == self.FREE) & (inflated_grid == self.FREE)
         
         frontier_cells = []
         for y in range(self.grid_height):
@@ -465,58 +584,136 @@ class MyDroneFSM(DroneAbstract):
         
         return frontier_info
     
-    def is_path_likely_clear(self, goal: Tuple[float, float]) -> bool:
-        """Check if the direct path to goal is likely clear of obstacles."""
+    def is_frontier_reachable_bfs(self, goal: Tuple[float, float], max_search_cells: int = 2000) -> Optional[List[Tuple[int, int]]]:
+        """Use BFS to check if there's a path from drone to frontier. Returns path as list of (x,y) cell coords, or None if unreachable."""
         current_pos = self.measured_gps_position()
         if current_pos is None:
-            return True
+            return None
         
-        # Sample points along the path
-        dx = goal[0] - current_pos[0]
-        dy = goal[1] - current_pos[1]
-        distance = math.sqrt(dx**2 + dy**2)
+        # Convert positions to grid cells
+        start_x, start_y = self.world_to_cell(current_pos[0], current_pos[1])
+        goal_x, goal_y = self.world_to_cell(goal[0], goal[1])
         
-        if distance < 1:
-            return True
+        if not self.is_valid_cell(start_x, start_y) or not self.is_valid_cell(goal_x, goal_y):
+            return None
         
-        # Check every 15 pixels along the path (more dense sampling)
-        num_samples = int(distance / 15) + 1
-        occupied_count = 0
-        unknown_count = 0
+        # Use inflated grid for safer path planning
+        planning_grid = self.inflate_obstacles()
         
-        for i in range(1, num_samples):
-            t = i / num_samples
-            sample_x = current_pos[0] + t * dx
-            sample_y = current_pos[1] + t * dy
+        # BFS to find path - track parent for path reconstruction
+        visited = np.zeros((self.grid_height, self.grid_width), dtype=bool)
+        parent = {}  # Store parent cell for path reconstruction
+        queue = deque([(start_x, start_y)])
+        visited[start_y, start_x] = True
+        parent[(start_x, start_y)] = None
+        cells_searched = 0
+        
+        goal_reached = False
+        goal_cell = None
+        
+        while queue and cells_searched < max_search_cells:
+            cx, cy = queue.popleft()
+            cells_searched += 1
             
-            cell_x, cell_y = self.world_to_cell(sample_x, sample_y)
-            if self.is_valid_cell(cell_x, cell_y):
-                cell_state = self.occupancy_grid[cell_y, cell_x]
-                
-                # Check 3x3 area around sample point for walls
-                for dy_check in [-1, 0, 1]:
-                    for dx_check in [-1, 0, 1]:
-                        check_x, check_y = cell_x + dx_check, cell_y + dy_check
-                        if self.is_valid_cell(check_x, check_y):
-                            cell_state = self.occupancy_grid[check_y, check_x]
-                            if cell_state == self.OCCUPIED:
-                                occupied_count += 1
-                            elif cell_state == self.UNKNOWN:
-                                unknown_count += 1
+            # Check if we reached the goal
+            if abs(cx - goal_x) <= 2 and abs(cy - goal_y) <= 2:  # Within 2 cells is close enough
+                goal_reached = True
+                goal_cell = (cx, cy)
+                break
+            
+            # Explore 8-connected neighbors
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    
+                    nx, ny = cx + dx, cy + dy
+                    
+                    if not self.is_valid_cell(nx, ny) or visited[ny, nx]:
+                        continue
+                    
+                    # Use inflated grid - only traverse FREE or UNKNOWN cells
+                    # This keeps paths away from obstacles
+                    cell_state = planning_grid[ny, nx]
+                    if cell_state != self.OCCUPIED:
+                        visited[ny, nx] = True
+                        parent[(nx, ny)] = (cx, cy)
+                        queue.append((nx, ny))
         
-        # Path is blocked if we detected many walls OR too much unknown (potential walls)
-        if occupied_count > 3:  # More than 3 wall cells detected
-            return False
+        if not goal_reached:
+            return None  # Path not found
         
-        # If path goes through mostly unknown territory and we found some walls, be cautious
-        if unknown_count > num_samples * 2 and occupied_count > 0:
-            return False
+        # Reconstruct path from goal to start
+        path = []
+        current = goal_cell
+        while current is not None:
+            path.append(current)
+            current = parent.get(current)
         
-        return True
+        path.reverse()  # Reverse to get start-to-goal path
+        return path
+    
+    def smooth_path_bspline(self, path_cells: List[Tuple[int, int]], num_points: int = 50) -> List[Tuple[float, float]]:
+        """Smooth the BFS path using B-spline interpolation.
+        
+        Args:
+            path_cells: List of (x, y) cell coordinates from BFS
+            num_points: Number of interpolated points to generate
+            
+        Returns:
+            List of (x, y) world coordinates along smoothed path
+        """
+        if path_cells is None or len(path_cells) < 3:
+            # Not enough points for spline, return original path in world coords
+            if path_cells is not None:
+                return [self.cell_to_world(x, y) for x, y in path_cells]
+            return []
+        
+        # Convert cell coordinates to world coordinates
+        world_coords = np.array([self.cell_to_world(x, y) for x, y in path_cells])
+        x_coords = world_coords[:, 0]
+        y_coords = world_coords[:, 1]
+        
+        # Remove duplicate consecutive points
+        unique_indices = [0]
+        for i in range(1, len(x_coords)):
+            if x_coords[i] != x_coords[unique_indices[-1]] or y_coords[i] != y_coords[unique_indices[-1]]:
+                unique_indices.append(i)
+        
+        x_coords = x_coords[unique_indices]
+        y_coords = y_coords[unique_indices]
+        
+        if len(x_coords) < 3:
+            # Still not enough unique points
+            return [(x_coords[i], y_coords[i]) for i in range(len(x_coords))]
+        
+        # Parametric B-spline interpolation
+        # Degree k: use min of 3 or (num_points - 1) to avoid errors
+        k = min(3, len(x_coords) - 1)
+        
+        try:
+            # Create parametric spline
+            tck, u = interpolate.splprep([x_coords, y_coords], s=0, k=k)
+            
+            # Generate smooth path with specified number of points
+            u_new = np.linspace(0, 1, num_points)
+            smooth_coords = interpolate.splev(u_new, tck)
+            
+            # Convert to list of tuples - smooth_coords is tuple of arrays
+            x_smooth = np.array(smooth_coords[0])  # type: ignore
+            y_smooth = np.array(smooth_coords[1])  # type: ignore
+            smooth_path = [(float(x_smooth[i]), float(y_smooth[i])) 
+                          for i in range(len(x_smooth))]
+            return smooth_path
+            
+        except Exception as e:
+            # If spline fails, return original path
+            return [(x_coords[i], y_coords[i]) for i in range(len(x_coords))]
     
     def select_frontier_goal(self) -> Optional[Tuple[float, float]]:
         """
         Select the best frontier and return its world coordinates as goal.
+        Uses BFS to verify path reachability through free cells.
         """
 
         # Detect all frontiers
@@ -529,6 +726,20 @@ class MyDroneFSM(DroneAbstract):
         if current_pos is None:
             return None # TODO: Implement alternative via odometry if GPS unavailable
 
+        # Filter frontiers by BFS reachability and store paths
+        reachable_frontiers = []
+        frontier_paths = {}  # Map centroid to path
+        
+        for centroid, gain, size in frontiers[:15]:  # Check top 15 to save computation
+            path = self.is_frontier_reachable_bfs(centroid)
+            if path is not None:
+                reachable_frontiers.append((centroid, gain, size))
+                frontier_paths[centroid] = path
+        
+        # If no reachable frontiers found, fall back to closest ones (maybe grid is incomplete)
+        if not reachable_frontiers:
+            reachable_frontiers = frontiers[:5]
+
         def utility(f):
             centroid, gain, size = f
             dx = centroid[0] - current_pos[0]
@@ -536,12 +747,27 @@ class MyDroneFSM(DroneAbstract):
             distance = math.hypot(dx, dy)
             return gain * 3.0 + size * 0.5 - distance * 0.005 # Objective 
 
-        frontiers.sort(key=utility, reverse=True)
-        return frontiers[0][0]
+        reachable_frontiers.sort(key=utility, reverse=True)
+        best_frontier = reachable_frontiers[0][0]
+        
+        # Store the path for this frontier if available
+        if best_frontier in frontier_paths:
+            raw_path = frontier_paths[best_frontier]
+            # Smooth the path using B-splines - fewer points for cleaner trajectory
+            self.current_path = self.smooth_path_bspline(raw_path, num_points=20)
+            self.path_waypoint_index = 0
+        else:
+            self.current_path = None
+        
+        # Reset goal timer when new goal is selected
+        self.goal_start_time = self.step_count
+        
+        return best_frontier
     
     def navigate_to_frontier(self, goal: Tuple[float, float]) -> CommandsDict:
         """
-        Navigate toward a frontier goal using P controller with obstacle avoidance.
+        Navigate toward a frontier goal using PID control and pure pursuit trajectory tracking.
+        Falls back to direct navigation if no path available.
         
         Args:
             goal: (x, y) world coordinates of target
@@ -556,51 +782,183 @@ class MyDroneFSM(DroneAbstract):
         if current_pos is None or current_angle is None:
             raise NotImplementedError("Odometry based calculation not implemented yet") # TODO: Odometry based calc
         
-        # Calculate direction to goal
-        dx = goal[0] - current_pos[0]
-        dy = goal[1] - current_pos[1]
+        # Pure pursuit: find look-ahead point on smoothed trajectory
+        target_world = None
+        on_path = False
         
-        # Get LIDAR readings for obstacle detection
-        lidar_values = self.lidar_values()
-        obstacle_ahead = False
-        if lidar_values is not None:
-            min_dist = min(lidar_values)
+        if self.current_path is not None and len(self.current_path) > 0:
+            # Pure pursuit parameters
+            LOOK_AHEAD_DIST = 50  # pixels - look ahead distance
             
-            # Check obstacle in forward direction more carefully
-            num_rays = len(lidar_values)
-            # Check center 60 degrees (30 degrees each side)
-            center_start = int(num_rays * 0.4)
-            center_end = int(num_rays * 0.6)
-            forward_min = min(lidar_values[center_start:center_end]) if center_end > center_start else min_dist
+            # Find closest point on entire remaining path (prevents oscillation from missed waypoints)
+            closest_idx = self.path_waypoint_index
+            closest_dist = float('inf')
             
-            if forward_min < 50:  # Obstacle ahead
-                obstacle_ahead = True
+            for i in range(self.path_waypoint_index, len(self.current_path)):
+                wp = self.current_path[i]
+                dx = wp[0] - current_pos[0]
+                dy = wp[1] - current_pos[1]
+                dist = math.sqrt(dx**2 + dy**2)
+                
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_idx = i
+            
+            # Update waypoint index to closest point (allows skipping ahead if overshot)
+            self.path_waypoint_index = closest_idx
+            
+            # Find look-ahead point starting from closest point
+            best_target = None
+            best_dist_diff = float('inf')
+            
+            for i in range(self.path_waypoint_index, len(self.current_path)):
+                wp = self.current_path[i]
+                dx = wp[0] - current_pos[0]
+                dy = wp[1] - current_pos[1]
+                dist = math.sqrt(dx**2 + dy**2)
+                
+                # Find waypoint closest to look-ahead distance
+                dist_diff = abs(dist - LOOK_AHEAD_DIST)
+                if dist_diff < best_dist_diff:
+                    best_dist_diff = dist_diff
+                    best_target = wp
+                
+                # Stop searching too far ahead
+                if dist > LOOK_AHEAD_DIST * 1.5:
+                    break
+            
+            if best_target is not None:
+                target_world = best_target
+                on_path = True
+            elif self.path_waypoint_index < len(self.current_path):
+                target_world = self.current_path[self.path_waypoint_index]
+                on_path = True
+            else:
+                target_world = goal
+        else:
+            target_world = goal
         
-        # Calculate target angle
+        # Calculate direction to target
+        dx = target_world[0] - current_pos[0]
+        dy = target_world[1] - current_pos[1]
+        
+        # Check for wall obstacles ahead using combined LIDAR+semantic
+        wall_obstacle_ahead = self.detect_wall_obstacle(distance_threshold=60.0)
+
+        
+        # PID controller for rotation
         target_angle = math.atan2(dy, dx)
-        diff_angle = normalize_angle(target_angle - current_angle)
+        angle_error = normalize_angle(target_angle - current_angle)
         
-        # P controller for rotation
-        kp_rotation = 1.2
-        rotation = kp_rotation * diff_angle
+        # Dead zone for small errors
+        DEAD_ZONE = 0.015  # ~0.9 degree - tighter dead zone
+        if abs(angle_error) < DEAD_ZONE:
+            angle_error = 0.0
+            self.angle_error_integral = 0.0  # Reset integral in dead zone
+        
+        # PID gains - tuned for strict trajectory tracking
+        kp = 1.5  # Proportional - increased for faster response
+        ki = 0.02  # Integral - slight increase for steady-state accuracy
+        kd = 0.5  # Derivative - increased damping to prevent overshoot
+        
+        # Integral term with anti-windup
+        self.angle_error_integral += angle_error
+        self.angle_error_integral = max(-8.0, min(8.0, self.angle_error_integral))  # Tighter clamp
+        
+        # Derivative term
+        angle_error_derivative = angle_error - self.last_angle_error
+        self.last_angle_error = angle_error
+        
+        # PID output
+        rotation = kp * angle_error + ki * self.angle_error_integral + kd * angle_error_derivative
         rotation = max(-1.0, min(1.0, rotation))
         command["rotation"] = float(rotation)
         
-        # Adjust speed based on obstacles and turning
-        if obstacle_ahead:
-            # Slow down and turn more when obstacle ahead
+        # Speed control - modulate based on tracking error and wall obstacles
+        if wall_obstacle_ahead:
+            # Wall detected - slow down significantly
             command["forward"] = 0.2
-            command["rotation"] *= 1.5  # Turn more aggressively
-            command["rotation"] = max(-1.0, min(1.0, command["rotation"]))
-        elif abs(rotation) > 0.8:
-            command["forward"] = 0.3
-        elif abs(rotation) > 0.5:
-            command["forward"] = 0.5
+        elif on_path:
+            # Following smooth trajectory - reduce speed with high rotation for tighter tracking
+            if abs(rotation) > 0.4:
+                command["forward"] = 0.5
+            elif abs(rotation) > 0.2:
+                command["forward"] = 0.65
+            else:
+                command["forward"] = 0.75
         else:
-            command["forward"] = 0.7
+            # Direct navigation
+            if abs(rotation) > 0.6:
+                command["forward"] = 0.4
+            else:
+                command["forward"] = 0.65
         
         return command
         
+    def detect_wall_obstacle(self, distance_threshold: float = 60.0) -> bool:
+        """
+        Detect if there's a wall obstacle ahead by combining LIDAR and semantic sensor.
+        
+        Logic: LIDAR detects all objects, semantic detects only drones/wounded/rescue center.
+        If LIDAR shows close obstacle but semantic doesn't detect anything at that angle,
+        then it must be a wall.
+        
+        Args:
+            distance_threshold: Distance threshold in pixels to consider as obstacle
+            
+        Returns:
+            bool: True if wall obstacle detected within threshold
+        """
+        lidar_values = self.lidar_values()
+        semantic_data = self.semantic_values()
+        
+        if lidar_values is None:
+            return False
+        
+        # Get lidar sensor for ray angles
+        lidar_sensor = self.lidar()
+        if lidar_sensor is None:
+            return False
+        
+        ray_angles = lidar_sensor.ray_angles  # type: ignore
+        
+        # Find rays with obstacles within threshold
+        close_obstacles = []
+        for i, dist in enumerate(lidar_values):
+            if dist < distance_threshold:
+                close_obstacles.append((dist, ray_angles[i]))
+        
+        if not close_obstacles:
+            return False  # No close obstacles at all
+        
+        # Check if any close obstacle is NOT detected by semantic sensor
+        # Semantic sensor can only detect: WOUNDED_PERSON, DRONE, RESCUE_CENTER (NOT walls)
+        if semantic_data is None or len(semantic_data) == 0:
+            # LIDAR sees obstacle but semantic doesn't = must be wall
+            return True
+        
+        # Check each close LIDAR obstacle
+        for lidar_dist, lidar_angle in close_obstacles:
+            # Check if this obstacle is detected by semantic sensor
+            found_in_semantic = False
+            for sem_data in semantic_data:
+                # Check if semantic detection is at similar angle and distance
+                angle_diff = abs(sem_data.angle - lidar_angle)
+                # Normalize angle difference to [-pi, pi]
+                if angle_diff > math.pi:
+                    angle_diff = 2 * math.pi - angle_diff
+                
+                # If semantic detects something at similar angle/distance, it's not a wall
+                if angle_diff < 0.2 and abs(sem_data.distance - lidar_dist) < 30:  # ~11 degrees tolerance
+                    found_in_semantic = True
+                    break
+            
+            # If this LIDAR obstacle is NOT in semantic, it's a wall
+            if not found_in_semantic:
+                return True
+        
+        return False  # All close obstacles are non-wall entities
+
     def process_lidar_sensor(self) -> bool:
         """
         Returns True if the drone collided with an obstacle.
@@ -843,11 +1201,16 @@ class MyDroneFSM(DroneAbstract):
                     if other_position is not None:
                         drone_positions.append((other_position[0], other_position[1]))
             
+            # Export smoothed B-spline path (already in world coordinates)
+            path_world = self.current_path  # Already smoothed and in world coords
+            
             data = {
                 'occupancy_grid': self.occupancy_grid.copy(),
+                'global_occupancy_grid': self.global_occupancy_grid.copy() if self.global_occupancy_grid is not None else None,
                 'visited_cells': self.visited_cells.copy(),
                 'frontiers': frontiers[:20],  # Top 20 frontiers only
                 'current_goal': self.current_frontier_goal,
+                'current_path': path_world,  # BFS path in world coordinates
                 'drone_positions': drone_positions,
                 'grid_origin': self.grid_origin,
                 'grid_resolution': self.grid_resolution,
@@ -903,18 +1266,21 @@ class MyDroneFSM(DroneAbstract):
 
     def control(self) -> CommandsDict:
         """
-        Main control loop of each drone. Uses a Finite State Machine (FSM) planning logic.
+        Decentralized main control loop of each drone. 
+        Uses a Finite State Machine (FSM) planning logic.
 
         Returns:
             CommandsDict: The control command for the drone.
         """
+        # Increment step counter for timer-based logic
+        self.step_count += 1
+        
         command: CommandsDict = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # ON FIRST CALL
-        # TODO: Right now it checks all the time. Check if there is any time variable to detect first call only.
 
         # Save initial position and return base
-        if self.start_position is None:
+        if self.step_count == 1:
             start_pos = self.measured_gps_position()
             if start_pos is not None:
                 self.start_position = (start_pos[0], start_pos[1])
@@ -994,11 +1360,35 @@ class MyDroneFSM(DroneAbstract):
         if self.state == self.State.SEARCHING_WOUNDED:
             # Frontier-based exploration with occupancy grid
             
-            # Find frontier
-            new_goal = self.select_frontier_goal()
-            if new_goal is not None:
-                old_goal = self.current_frontier_goal
-                self.current_frontier_goal = new_goal
+            # Only update frontier goal if:
+            # 1. No current goal exists, OR
+            # 2. Close to current goal (within threshold), OR
+            # 3. Timeout exceeded (stuck pursuing same goal too long)
+            should_update_goal = False
+            GOAL_UPDATE_THRESHOLD = 80.0  # Only update when within 80 pixels of current goal
+            
+            if self.current_frontier_goal is None:
+                should_update_goal = True
+            else:
+                current_pos = self.measured_gps_position()
+                if current_pos is not None:
+                    dx = self.current_frontier_goal[0] - current_pos[0]
+                    dy = self.current_frontier_goal[1] - current_pos[1]
+                    dist_to_goal = math.sqrt(dx**2 + dy**2)
+                    if dist_to_goal < GOAL_UPDATE_THRESHOLD:
+                        should_update_goal = True
+                    
+                    # Check for timeout (stuck in loop)
+                    elapsed_steps = self.step_count - self.goal_start_time
+                    if elapsed_steps > self.goal_timeout_threshold:
+                        should_update_goal = True
+                        # print(f"Drone {self.identifier}: Goal timeout ({elapsed_steps} steps), selecting new frontier")
+            
+            # Find new frontier only when needed
+            if should_update_goal:
+                new_goal = self.select_frontier_goal()
+                if new_goal is not None:
+                    self.current_frontier_goal = new_goal
             
             # Navigate to frontier 
             if self.current_frontier_goal is not None:
