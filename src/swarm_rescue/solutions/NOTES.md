@@ -78,3 +78,71 @@ Mission swarm
 - Feb 27 - refine 
 - March 6 - refine
 - March 13 - refine
+
+
+
+-----------------------------------------
+- traj is not very smooth and I am doing PID following that traj
+- After final waypoint still didnt pass frontier goal, stuck looping at final state
+- After picking wounded person, implement proper nav to rescue center
+
+
+
+Checkpoint 1 results: 1st two environments
+count_reachable v3 = 363463
+        * Round n°1/2: 
+                rescued nb: 1/1, explor. score: 95.8%, health return score: 94.0%, walltime elapsed: 45s/270s, elapse timestep: 1337/2700 steps, time to rescue all: 857 steps.
+                percentage of drones destroyed: 0.0 %, mean percentage of drones health : 0.0 %.
+                round score: 88.0%, frequency: 29.80 steps/s.
+
+count_reachable v3 = 363463
+        * Round n°2/2: 
+                rescued nb: 1/1, explor. score: 99.8%, health return score: 92.0%, walltime elapsed: 42s/270s, elapse timestep: 1229/2700 steps, time to rescue all: 860 steps.
+                percentage of drones destroyed: 0.0 %, mean percentage of drones health : 0.0 %.
+                round score: 95.2%, frequency: 29.50 steps/s.
+
+
+
+----------------
+TODO for Jan 31st:
+- DONE: In the interpolation logic for anything adaptive, instead of uniform scaling do exponential tail of sorts. For example, in velocity control to prevent collision, as distance gets smaller exponentially decrease the speed at a rate. But linearly increase. This is so that even though inertia, it will try to vigorously stop.
+- Implement closed loop control for gettign back to rescue center. Since u dont know how many waypoints to rescue center u need to track segments with enough like how frontier is.
+- Rescue center posiiton is sometimes not found out and or sometimes is not in the right place. Find why.
+- Implement return to base using similar logic as that of rescue center.
+
+
+
+
+----------------------------------------------------------------
+Meet on Feb 2: 2/2/26
+
+Notes:
+- While moving with human, it may be slow.
+- Rescue center position identified wrong
+- bfs path back to rescue center sometimes not found.
+- no reachable frontier and goes to random explore in between fidning frontier. idk why. but it should find.
+- optimizing speed- occupancy grid
+- write code to make lidar find if small obstacle- if so go to semantic sensor range.
+- some way to identify narrow spaces and put special logic.
+- for frontiers in multi drone- do nearest drone allocation
+- Try plotting bfs path without smoothening and with smoothening. Si smoothining needed?
+- race conditions eliminate- shoudl back off- do across time, no race again.
+- frontier goal distance buffer- narrow space hoga?
+- frontier distance check no L2 do, try line of sight distance
+- Ramer–Douglas–Peucker (RDP)- it reduces waypoints to find a better path- but does not cosnider obstacle. we need to consider obstacle.
+- go through BFS deeper- why path not correct? lil short do. Arnav wants waypoint lil do near wall corners.
+- but ad wants smooth for speed. speed VS distance tradeoff
+- make algo based on search VS drop person.
+- drone colliison use inflated wall but then problem in narrow spaces.
+- premature return to base, cuz frontiers exist but not reachable.
+- if frontier not reachable, reach as best as possible.
+- closed loop trip back to rescue center. and back to base
+- real time other drone avoidance - lil bit angle turn same direction.
+- speed efficiency - is it occupancy grid?
+
+
+
+
+
+
+

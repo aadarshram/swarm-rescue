@@ -35,13 +35,19 @@ class OccupancyGridVisualizer:
         self.visits_img = None
         self.colorbar = None
         self.frontier_scatter = None
+        self.frontier_circles = []  # Store frontier buffer circles
         self.goal_scatter = None
         self.drone_scatter = None
         self.path_line = None  # BFS path visualization
+        self.rescue_path_line = None  # Rescue center path
+        self.rescue_goal_marker = None  # Rescue center marker
+        self.lookahead_marker = None  # Current lookahead waypoint
+        self.inflated_img = None  # Inflated obstacles overlay
         
         # Track map dimensions to detect changes
         self.last_extent = None
         self.last_timestamp = None
+        self.last_path_id = None  # Track when path changes
         
         # Setup plots
         self.setup_plots()
@@ -88,12 +94,17 @@ class OccupancyGridVisualizer:
         occupancy_grid = data.get('occupancy_grid')
         global_occupancy_grid = data.get('global_occupancy_grid')
         visited_cells = data.get('visited_cells')
+        inflated_grid = data.get('inflated_grid')  # Inflated obstacles
         frontiers = data.get('frontiers', [])
         current_goal = data.get('current_goal')
         current_path = data.get('current_path')  # BFS path
+        lookahead_waypoint = data.get('lookahead_waypoint')  # Current lookahead target
+        rescue_center_path = data.get('rescue_center_path')  # BFS path to rescue center
+        rescue_center_goal = data.get('rescue_center_goal')  # Rescue center position
         drone_positions = data.get('drone_positions', [])
         grid_origin = data.get('grid_origin', (0, 0))
         grid_resolution = data.get('grid_resolution', 8)
+        goal_buffer = data.get('goal_buffer', 10)  # Frontier buffer radius in cells
         timestamp = data.get('timestamp', 0)
         
         if occupancy_grid is None:
@@ -140,6 +151,20 @@ class OccupancyGridVisualizer:
             self.grid_img.set_extent(current_extent)
             self.ax_grid.set_xlim(current_extent[0], current_extent[1])
             self.ax_grid.set_ylim(current_extent[2], current_extent[3])
+        
+        # Overlay inflated obstacles in semi-transparent grey
+        if inflated_grid is not None:
+            # Create RGBA overlay for inflated regions
+            inflated_overlay = np.zeros((grid_height, grid_width, 4), dtype=np.float32)
+            inflated_mask = (inflated_grid == 2) & (occupancy_grid != 2)  # Inflated but not original obstacle
+            inflated_overlay[inflated_mask] = [0.5, 0.5, 0.5, 0.3]  # Grey with 30% opacity
+            
+            if self.inflated_img is None:
+                self.inflated_img = self.ax_grid.imshow(inflated_overlay, origin='lower', 
+                                                        extent=current_extent, zorder=2)
+            else:
+                self.inflated_img.set_data(inflated_overlay)
+                self.inflated_img.set_extent(current_extent)
         
         # Display global grid or visit heatmap on right panel
         if self.show_global and global_occupancy_grid is not None:
@@ -196,6 +221,9 @@ class OccupancyGridVisualizer:
         if self.frontier_scatter is not None:
             self.frontier_scatter.remove()
             self.frontier_scatter = None
+        for circle in self.frontier_circles:
+            circle.remove()
+        self.frontier_circles = []
         if self.goal_scatter is not None:
             self.goal_scatter.remove()
             self.goal_scatter = None
@@ -205,15 +233,24 @@ class OccupancyGridVisualizer:
         if self.path_line is not None:
             self.path_line.remove()
             self.path_line = None
+        if self.rescue_path_line is not None:
+            self.rescue_path_line.remove()
+            self.rescue_path_line = None
+        if self.rescue_goal_marker is not None:
+            self.rescue_goal_marker.remove()
+            self.rescue_goal_marker = None
+        if self.lookahead_marker is not None:
+            self.lookahead_marker.remove()
+            self.lookahead_marker = None
         
-        # Plot frontiers on both axes
+        # Plot frontiers on both axes with buffer circles
         if frontiers:
             frontier_x = [f[0][0] for f in frontiers]
             frontier_y = [f[0][1] for f in frontiers]
             self.frontier_scatter = self.ax_grid.scatter(frontier_x, frontier_y, 
                                                          c='cyan', s=50, marker='x', 
                                                          label='Frontiers', alpha=0.7,
-                                                         linewidths=2)
+                                                         linewidths=2, zorder=4)
         
         # Plot BFS path if available
         if current_path is not None and len(current_path) > 0:
@@ -221,11 +258,34 @@ class OccupancyGridVisualizer:
             path_y = [p[1] for p in current_path]
             self.path_line, = self.ax_grid.plot(path_x, path_y, 
                                                  'g-', linewidth=2, alpha=0.6,
-                                                 label='BFS Path')
+                                                 label='Current Path', zorder=5)
             # Also plot path waypoints as small dots
             self.ax_grid.scatter(path_x, path_y, 
                                 c='lime', s=20, marker='o', 
                                 alpha=0.5, zorder=5)
+        
+        # Plot lookahead waypoint if available
+        if lookahead_waypoint is not None:
+            self.lookahead_marker = self.ax_grid.scatter([lookahead_waypoint[0]], 
+                                                         [lookahead_waypoint[1]], 
+                                                         c='orange', s=150, marker='D', 
+                                                         label='Lookahead Target',
+                                                         edgecolors='black', linewidths=1.5,
+                                                         zorder=7)
+        
+        # Plot rescue center path in different color
+        if rescue_center_path is not None and len(rescue_center_path) > 0:
+            rc_path_x = [p[0] for p in rescue_center_path]
+            rc_path_y = [p[1] for p in rescue_center_path]
+            self.rescue_path_line, = self.ax_grid.plot(rc_path_x, rc_path_y, 'r-', 
+                                                       linewidth=2.5, label='Rescue Path', 
+                                                       alpha=0.8, zorder=5)
+            # Plot rescue center goal
+            if rescue_center_goal is not None:
+                self.rescue_goal_marker, = self.ax_grid.plot(rescue_center_goal[0], 
+                                                             rescue_center_goal[1], 
+                                                             'r*', markersize=15, 
+                                                             label='Rescue Center', zorder=6)
         
         # Plot current goal
         if current_goal is not None:
@@ -233,7 +293,13 @@ class OccupancyGridVisualizer:
                                                      c='yellow', s=200, marker='*', 
                                                      label='Current Goal', 
                                                      edgecolors='black', linewidths=2)
-        
+            # Plot goal buffer circle
+            goal_circle = Circle((current_goal[0], current_goal[1]), 
+                                 goal_buffer * grid_resolution, 
+                                 color='yellow', alpha=0.2, zorder=3)
+            self.ax_grid.add_patch(goal_circle)
+            self.frontier_circles.append(goal_circle)
+            
         # Plot drone positions
         if drone_positions:
             drone_x = [p[0] for p in drone_positions]
@@ -243,9 +309,12 @@ class OccupancyGridVisualizer:
                                                       label='Drones', 
                                                       edgecolors='white', linewidths=2)
         
-        # Update legend
-        if self.frontier_scatter or self.goal_scatter or self.drone_scatter or self.path_line:
-            self.ax_grid.legend(loc='upper right', fontsize=8)
+        # Update legend - only show elements that exist
+        handles, labels = self.ax_grid.get_legend_handles_labels()
+        # Remove duplicate labels
+        by_label = dict(zip(labels, handles))
+        if by_label:
+            self.ax_grid.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=8)
         
         # Update title with stats
         if occupancy_grid is not None:
@@ -289,6 +358,9 @@ class OccupancyGridVisualizer:
         if self.frontier_scatter is not None:
             self.frontier_scatter.remove()
             self.frontier_scatter = None
+        for circle in self.frontier_circles:
+            circle.remove()
+        self.frontier_circles = []
         if self.goal_scatter is not None:
             self.goal_scatter.remove()
             self.goal_scatter = None
@@ -298,6 +370,18 @@ class OccupancyGridVisualizer:
         if self.path_line is not None:
             self.path_line.remove()
             self.path_line = None
+        if self.rescue_path_line is not None:
+            self.rescue_path_line.remove()
+            self.rescue_path_line = None
+        if self.rescue_goal_marker is not None:
+            self.rescue_goal_marker.remove()
+            self.rescue_goal_marker = None
+        if self.lookahead_marker is not None:
+            self.lookahead_marker.remove()
+            self.lookahead_marker = None
+        if self.inflated_img is not None:
+            self.inflated_img.remove()
+            self.inflated_img = None
         
         # Clear axes and reset
         self.ax_grid.clear()
